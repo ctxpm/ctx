@@ -216,6 +216,32 @@ describe('publishing as a user', () => {
     expect(version?.integrity).toBe(`sha256-${originalSha}`);
   });
 
+  it('keeps the artifact when the same archive is published several times at once', async () => {
+    const name = uniqueName('same-bytes');
+    const archive = await packageTgz(name, '1.0.0');
+    const sha = createHash('sha256').update(archive).digest('hex');
+    const attempts = await Promise.all([1, 2, 3, 4].map(() => publish(owner, archive)));
+    expect(attempts.map((attempt) => attempt.status).sort()).toEqual([201, 409, 409, 409]);
+    expect((await publish(owner, archive)).status).toBe(409);
+
+    const [stored] = await adminBucket.file(`packages/${name}/1.0.0/${sha}.tgz`).download();
+    expect(stored.equals(archive)).toBe(true);
+  });
+
+  it('publishes a package whose README and file list are too large to store whole', async () => {
+    const name = uniqueName('large');
+    const files: Record<string, string> = { 'README.md': `# ${name}\n${'x'.repeat(200_000)}` };
+    for (let index = 0; index < 1500; index++) {
+      files[`docs/${'long-directory-name/'.repeat(4)}file-${index}.md`] = 'x';
+    }
+    expect((await publish(owner, await packageTgz(name, '1.0.0', { files }))).status).toBe(201);
+    const version = (await adminDb.doc(`packages/${name}/versions/1.0.0`).get()).data();
+    expect(version?.readme).toBeNull();
+    expect(version?.fileCount).toBe(1503);
+    expect(version?.files.length).toBeLessThanOrEqual(1000);
+    expect(version?.files.length).toBeGreaterThan(100);
+  });
+
   it('accepts only one of several simultaneous publishes of the same version', async () => {
     const name = uniqueName('race');
     expect((await publish(owner, await packageTgz(name, '1.0.0'))).status).toBe(201);

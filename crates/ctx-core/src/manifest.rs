@@ -23,7 +23,16 @@ pub struct Manifest {
     pub description: String,
     #[serde(default)]
     pub dependencies: BTreeMap<String, String>,
+    /// Free-form sections; ctx only checks that they are objects, like the registry does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provides: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engines: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<serde_json::Value>,
 }
+
+const MAX_DEPENDENCIES: usize = 200;
 
 /// Lowercase kebab-case, at most 64 characters.
 pub fn is_package_name(name: &str) -> bool {
@@ -74,6 +83,18 @@ impl Manifest {
         }
         if self.description.chars().count() > 500 {
             problems.push("description must be at most 500 characters".into());
+        }
+        if self.dependencies.len() > MAX_DEPENDENCIES {
+            problems.push(format!("at most {MAX_DEPENDENCIES} dependencies"));
+        }
+        for (field, value) in [
+            ("provides", &self.provides),
+            ("engines", &self.engines),
+            ("provenance", &self.provenance),
+        ] {
+            if value.as_ref().is_some_and(|value| !value.is_object()) {
+                problems.push(format!("{field} must be an object"));
+            }
         }
         for (name, dependency_range) in &self.dependencies {
             if !is_package_name(name) {
@@ -166,6 +187,28 @@ mod tests {
         assert!(problems(&VALID.replace("\"team\"", "\"Team\"")).contains("type must be"));
         assert!(problems("not json").contains("invalid manifest.json"));
         assert!(problems(r#"{"schemaVersion":1}"#).contains("invalid manifest.json"));
+    }
+
+    #[test]
+    fn checks_the_same_limits_as_the_registry() {
+        let many: Vec<String> = (0..201)
+            .map(|index| format!("\"dep-{index}\":\"*\""))
+            .collect();
+        let too_many = VALID.replace(
+            "\"type\":\"team\"",
+            &format!("\"type\":\"team\",\"dependencies\":{{{}}}", many.join(",")),
+        );
+        assert!(problems(&too_many).contains("at most 200 dependencies"));
+        for field in ["provides", "engines", "provenance"] {
+            let bad = VALID.replace(
+                "\"type\":\"team\"",
+                &format!("\"type\":\"team\",\"{field}\":\"text\""),
+            );
+            assert!(
+                problems(&bad).contains(&format!("{field} must be an object")),
+                "{field}"
+            );
+        }
     }
 
     #[test]

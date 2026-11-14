@@ -14,7 +14,7 @@ use ctx_core::install::{self, Target};
 use ctx_core::lockfile::{LockedPackage, Lockfile};
 use ctx_core::manifest::is_package_name;
 use ctx_core::project::Project;
-use ctx_core::registry::{Registry, VersionInfo};
+use ctx_core::registry::{Registry, TrustedPublisher, VersionInfo};
 use ctx_core::reqwest::blocking::Client;
 use ctx_core::resolve::{self, Options, Source};
 use ctx_core::{Result, archive, auth, range};
@@ -150,6 +150,27 @@ enum AccessCommand {
         who: Vec<String>,
         #[arg(long)]
         maintainer: bool,
+    },
+    /// Let the workflows of a GitHub repository publish this package without a personal login
+    Trust {
+        package: String,
+        /// owner/repo
+        repository: String,
+        /// Only this workflow file, for example release.yml (or a full owner/repo/.github/workflows/file.yml)
+        #[arg(long, value_name = "FILE")]
+        workflow: Option<String>,
+        /// Only jobs running on this git ref, for example refs/heads/main
+        #[arg(long = "ref", value_name = "REF")]
+        git_ref: Option<String>,
+        /// Only jobs using this deployment environment
+        #[arg(long, value_name = "NAME")]
+        environment: Option<String>,
+    },
+    /// Stop trusting a GitHub repository
+    Untrust {
+        package: String,
+        /// owner/repo
+        repository: String,
     },
     /// Make a package public or restricted
     Visibility {
@@ -448,6 +469,21 @@ fn cmd_install(registry_name: Option<&str>, args: InstallArgs) -> Result<()> {
                 "--frozen needs a ctx.lock in {}",
                 dir.display()
             )));
+        }
+        // A lockfile that no longer matches ctx.toml would install the wrong thing quietly.
+        for (name, wanted) in &project.packages {
+            let fits = lockfile
+                .packages
+                .get(name)
+                .and_then(|package| semver::Version::parse(&package.version).ok())
+                .is_some_and(|version| {
+                    range::parse(wanted).is_ok_and(|wanted| range::matches(&wanted, &version))
+                });
+            if !fits {
+                return Err(err(format!(
+                    "ctx.lock does not match ctx.toml: \"{name}\" is wanted as \"{wanted}\"; run `ctx install` without --frozen to update the lockfile"
+                )));
+            }
         }
         // With no "previous" state nothing is removed; frozen installs only add or replace.
         return apply(&registry, &dir, &project, &lockfile, lockfile.clone());
@@ -821,6 +857,94 @@ fn cmd_access(registry_name: Option<&str>, command: AccessCommand) -> Result<()>
             println!("maintainers:  {}", list(&info.maintainers));
             println!("readers:      {}", list(&info.readers));
             println!("domains:      {}", list(&info.reader_domains));
+            for publisher in &info.trusted_publishers {
+                let limits: Vec<String> = [
+                    publisher
+                        .workflow
+                        .as_ref()
+                        .map(|workflow| format!("workflow {workflow}")),
+                    publisher
+                        .git_ref
+                        .as_ref()
+                        .map(|git_ref| format!("ref {git_ref}")),
+                    publisher
+                        .environment
+                        .as_ref()
+                        .map(|environment| format!("environment {environment}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                println!(
+                    "publisher:    {}{}",
+                    publisher.repository,
+                    if limits.is_empty() {
+                        "  (any workflow, any branch)".to_string()
+                    } else {
+                        format!("  ({})", limits.join(", "))
+                    }
+                );
+            }
+        }
+        AccessCommand::Trust {
+            package,
+            repository,
+            workflow,
+            git_ref,
+            environment,
+        } => {
+            let info = load(&package)?;
+            let repository = repository.trim().to_lowercase();
+            if repository.split('/').count() != 2 || repository.split('/').any(str::is_empty) {
+                return Err(err("expected a GitHub repository as owner/repo"));
+            }
+            // A bare file name means a workflow in the trusted repository itself.
+            let workflow = workflow.map(|workflow| {
+                let workflow = workflow.trim().to_lowercase();
+                if workflow.contains('/') {
+                    workflow
+                } else {
+                    format!("{repository}/.github/workflows/{workflow}")
+                }
+            });
+            let mut publishers: Vec<TrustedPublisher> = info
+                .trusted_publishers
+                .iter()
+                .filter(|entry| entry.repository != repository)
+                .cloned()
+                .collect();
+            publishers.push(TrustedPublisher {
+                provider: "github".into(),
+                repository: repository.clone(),
+                workflow,
+                git_ref,
+                environment,
+            });
+            registry.set_access(
+                &package,
+                &BTreeMap::from([("trustedPublishers", json!(publishers))]),
+            )?;
+            println!("{package} now trusts {repository}");
+        }
+        AccessCommand::Untrust {
+            package,
+            repository,
+        } => {
+            let info = load(&package)?;
+            let repository = repository.trim().to_lowercase();
+            let publishers: Vec<&TrustedPublisher> = info
+                .trusted_publishers
+                .iter()
+                .filter(|entry| entry.repository != repository)
+                .collect();
+            if publishers.len() == info.trusted_publishers.len() {
+                return Err(err(format!("{package} does not trust {repository}")));
+            }
+            registry.set_access(
+                &package,
+                &BTreeMap::from([("trustedPublishers", json!(publishers))]),
+            )?;
+            println!("{package} no longer trusts {repository}");
         }
         AccessCommand::Visibility {
             package,

@@ -28,8 +28,9 @@ export interface TarballLimits {
 export const DEFAULT_LIMITS: TarballLimits = {
   maxEntries: 10_000,
   maxUnpackedBytes: 200 * 1024 * 1024,
-  maxManifestBytes: 256 * 1024,
-  maxReadmeBytes: 256 * 1024,
+  // Manifest and README are stored on the version document, which Firestore caps at 1 MiB.
+  maxManifestBytes: 64 * 1024,
+  maxReadmeBytes: 128 * 1024,
 };
 
 export class TarballError extends Error {
@@ -76,6 +77,9 @@ export async function inspectTarball(data: Buffer, limits: TarballLimits = DEFAU
   /** Small files kept in memory because they may turn out to be the manifest or README. */
   const kept = new Map<string, Buffer>();
   let unpackedSize = 0;
+  /** First path segment of the first entry: the only directory that can be the package root. */
+  let topLevel: string | undefined;
+  const keptSlots = new Set<string>();
 
   extract.on('entry', (header, stream, next) => {
     let path: string;
@@ -99,7 +103,19 @@ export async function inspectTarball(data: Buffer, limits: TarballLimits = DEFAU
     const base = path.split('/').pop() ?? '';
     const keepLimit =
       base === 'manifest.json' ? limits.maxManifestBytes : base.toLowerCase() === 'readme.md' ? limits.maxReadmeBytes : 0;
-    const keep = isFile && depth <= 2 && keepLimit > 0;
+    // Only the manifest and README of the package root can matter: the archive root, or
+    // the one top-level directory every entry may live under. Keeping at most one of each
+    // per location bounds the memory this uses, whatever the archive contains.
+    const segments = path.split('/');
+    if (topLevel === undefined && segments[0] !== undefined) {
+      topLevel = segments[0];
+    }
+    const atRoot = depth === 1 || (depth === 2 && segments[0] === topLevel);
+    const slot = `${depth === 1 ? '' : `${segments[0]}/`}${base === 'manifest.json' ? 'manifest' : 'readme'}`;
+    const keep = isFile && atRoot && keepLimit > 0 && !keptSlots.has(slot);
+    if (keep) {
+      keptSlots.add(slot);
+    }
     const chunks: Buffer[] = [];
     let size = 0;
     let overflow = false;

@@ -28,6 +28,24 @@ describe('inspectTarball', () => {
     await expect(inspectTarball(archive)).rejects.toThrow('manifest.json not found');
   });
 
+  it('keeps only the manifest and README of the package root in memory', async () => {
+    // Many README files in sibling directories must not be buffered: none can be the root.
+    const archive = await tgz([
+      { name: 'manifest.json', content: manifest('alpha', '1.0.0') },
+      ...Array.from({ length: 50 }, (_, index) => ({ name: `dir${index}/README.md`, content: 'x'.repeat(2000) })),
+    ]);
+    const info = await inspectTarball(archive);
+    expect(info.readme).toBeNull();
+    expect(info.files).toHaveLength(51);
+
+    const twoReadmes = await tgz([
+      { name: 'package/manifest.json', content: manifest('alpha', '1.0.0') },
+      { name: 'package/README.md', content: 'first' },
+      { name: 'package/readme.md', content: 'second' },
+    ]);
+    expect((await inspectTarball(twoReadmes)).readme).toBe('first');
+  });
+
   it('rejects symbolic links', async () => {
     const archive = await tgz([
       { name: 'manifest.json', content: manifest('alpha', '1.0.0') },
