@@ -4,6 +4,9 @@
 //! Every package is installed at exactly one version. For each name the highest version
 //! that satisfies every range on it wins; a version pinned in the lockfile is kept as
 //! long as it still fits. Ranges that cannot be satisfied together are an error.
+//!
+//! The search is greedy: it never revisits a choice that still fits, so in rare graphs a
+//! solution that needs an earlier package to move down is reported as a conflict.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -87,6 +90,9 @@ fn choose<'a>(
         .max_by(|a, b| a.version.cmp(&b.version))
 }
 
+/// Upper bound on resolver steps; only a pathological dependency graph can reach it.
+const MAX_STEPS: usize = 100_000;
+
 /// Resolves `roots` (package name to range) against `source`.
 pub fn resolve(
     roots: &BTreeMap<String, String>,
@@ -97,6 +103,9 @@ pub fn resolve(
     let mut selected: BTreeMap<String, VersionInfo> = BTreeMap::new();
     let mut known: BTreeMap<String, Option<Vec<VersionInfo>>> = BTreeMap::new();
     let mut skipped: Vec<Skipped> = Vec::new();
+    // Names for which no version fits right now. A later change elsewhere in the graph can
+    // lift the ranges that block them, so this only becomes an error at the end.
+    let mut blocked: BTreeSet<String> = BTreeSet::new();
     let mut queue: VecDeque<String> = VecDeque::new();
 
     for (name, raw) in roots {
@@ -111,16 +120,30 @@ pub fn resolve(
         queue.push_back(name.clone());
     }
 
+    let mut steps = 0usize;
     while let Some(name) = queue.pop_front() {
+        steps += 1;
+        if steps > MAX_STEPS {
+            return Err(err(
+                "could not resolve the dependencies: the packages keep forcing each other to other versions",
+            ));
+        }
+
         let wanted = constraints
             .get(&name)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        if wanted.is_empty() {
+            // Nothing asks for this package any more.
+            blocked.remove(&name);
+            continue;
+        }
         if let Some(current) = selected.get(&name) {
             if wanted
                 .iter()
                 .all(|constraint| range::matches(&constraint.range, &current.version))
             {
+                blocked.remove(&name);
                 continue;
             }
         }
@@ -152,23 +175,27 @@ pub fn resolve(
         };
 
         let Some(pick) = choose(versions, wanted, options.locked.get(&name)) else {
-            let mut available: Vec<String> = versions
-                .iter()
-                .filter(|candidate| !candidate.yanked)
-                .map(|candidate| candidate.version.to_string())
-                .collect();
-            available.truncate(10);
-            return Err(err(format!(
-                "no version of \"{name}\" satisfies {}; available: {}",
-                describe(wanted),
-                if available.is_empty() {
-                    "none".to_string()
-                } else {
-                    available.join(", ")
-                }
-            )));
+            blocked.insert(name);
+            continue;
         };
         let pick = pick.clone();
+        blocked.remove(&name);
+
+        // Replacing a version withdraws everything the old version asked for; otherwise its
+        // ranges would keep constraining packages it no longer depends on.
+        if let Some(previous) = selected.get(&name) {
+            let previous_requirer = format!("{name}@{}", previous.version);
+            for (dependency, wanted_by_others) in constraints.iter_mut() {
+                let before = wanted_by_others.len();
+                wanted_by_others.retain(|constraint| {
+                    constraint.required_by.as_deref() != Some(previous_requirer.as_str())
+                });
+                if wanted_by_others.len() != before {
+                    queue.push_back(dependency.clone());
+                }
+            }
+            skipped.retain(|entry| entry.required_by != previous_requirer);
+        }
 
         let requirer = format!("{name}@{}", pick.version);
         for (dependency, raw) in &pick.dependencies {
@@ -186,8 +213,7 @@ pub fn resolve(
         selected.insert(name, pick);
     }
 
-    // A package can be picked and later replaced by a lower version with other
-    // dependencies; keep only what is still reachable from the roots.
+    // Keep only what is still reachable from the roots through the selected versions.
     let mut reachable: BTreeSet<String> = BTreeSet::new();
     let mut pending: Vec<String> = roots.keys().cloned().collect();
     while let Some(name) = pending.pop() {
@@ -198,6 +224,32 @@ pub fn resolve(
             pending.extend(package.dependencies.keys().cloned());
         }
     }
+
+    if let Some(name) = blocked.iter().find(|name| reachable.contains(*name)) {
+        let wanted = constraints.get(name).map(Vec::as_slice).unwrap_or_default();
+        let mut available: Vec<String> = known
+            .get(name)
+            .and_then(Option::as_ref)
+            .map(|versions| {
+                versions
+                    .iter()
+                    .filter(|candidate| !candidate.yanked)
+                    .map(|candidate| candidate.version.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        available.truncate(10);
+        return Err(err(format!(
+            "no version of \"{name}\" satisfies {}; available: {}",
+            describe(wanted),
+            if available.is_empty() {
+                "none".to_string()
+            } else {
+                available.join(", ")
+            }
+        )));
+    }
+
     selected.retain(|name, _| reachable.contains(name));
     skipped.retain(|entry| reachable.contains(&entry.name));
 
@@ -329,6 +381,75 @@ mod tests {
             versions(&resolution),
             ["a@1.0.0", "b@1.0.0", "shared@1.5.0"]
         );
+    }
+
+    /// A graph in which "shared" is picked at 2.0.0 first and only later narrowed to 1.x:
+    /// the narrowing range sits two levels deep, so it arrives after shared was chosen.
+    fn narrowed_later(shared_1: &[(&str, &str)], shared_2: &[(&str, &str)]) -> Fake {
+        Fake::default()
+            .with("a", "1.0.0", &[("shared", "*"), ("mid", "*")])
+            .with("mid", "1.0.0", &[("deep", "*")])
+            .with("deep", "1.0.0", &[("shared", "<2.0.0")])
+            .with("shared", "1.5.0", shared_1)
+            .with("shared", "2.0.0", shared_2)
+            .with("sub", "1.2.0", &[])
+            .with("sub", "2.1.0", &[])
+    }
+
+    #[test]
+    fn a_replaced_version_withdraws_its_own_ranges() {
+        // shared@2.0.0 asks for sub ^2; its replacement shared@1.5.0 asks for sub ^1. The
+        // range of the replaced version must not linger and cause a false conflict.
+        let mut source = narrowed_later(&[("sub", "^1.0.0")], &[("sub", "^2.0.0")]);
+        let resolution = resolve(&roots(&[("a", "*")]), &mut source, &Options::default()).unwrap();
+        assert_eq!(
+            versions(&resolution),
+            [
+                "a@1.0.0",
+                "deep@1.0.0",
+                "mid@1.0.0",
+                "shared@1.5.0",
+                "sub@1.2.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_conflict_that_a_later_replacement_lifts_is_not_an_error() {
+        // "sub" is asked for as ^2 (by shared@2.0.0) and ^1 (by c) before shared is
+        // narrowed: no version fits at that moment. Once shared moves to 1.x, it resolves.
+        let mut source =
+            narrowed_later(&[], &[("sub", "^2.0.0")]).with("c", "1.0.0", &[("sub", "^1.0.0")]);
+        let resolution = resolve(
+            &roots(&[("a", "*"), ("c", "*")]),
+            &mut source,
+            &Options::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            versions(&resolution),
+            [
+                "a@1.0.0",
+                "c@1.0.0",
+                "deep@1.0.0",
+                "mid@1.0.0",
+                "shared@1.5.0",
+                "sub@1.2.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dependency_of_a_replaced_version_is_dropped() {
+        // Only shared@2.0.0 needed "sub" and the invisible "hidden"; neither is installed
+        // or reported once shared has moved to 1.x.
+        let mut source = narrowed_later(&[], &[("sub", "^2.0.0"), ("hidden", "*")]);
+        let resolution = resolve(&roots(&[("a", "*")]), &mut source, &Options::default()).unwrap();
+        assert_eq!(
+            versions(&resolution),
+            ["a@1.0.0", "deep@1.0.0", "mid@1.0.0", "shared@1.5.0"]
+        );
+        assert!(resolution.skipped.is_empty());
     }
 
     #[test]
