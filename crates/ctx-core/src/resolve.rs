@@ -383,69 +383,71 @@ mod tests {
         );
     }
 
+    /// A graph in which "shared" is picked at 2.0.0 first and only later narrowed to 1.x:
+    /// the narrowing range sits two levels deep, so it arrives after shared was chosen.
+    fn narrowed_later(shared_1: &[(&str, &str)], shared_2: &[(&str, &str)]) -> Fake {
+        Fake::default()
+            .with("a", "1.0.0", &[("shared", "*"), ("mid", "*")])
+            .with("mid", "1.0.0", &[("deep", "*")])
+            .with("deep", "1.0.0", &[("shared", "<2.0.0")])
+            .with("shared", "1.5.0", shared_1)
+            .with("shared", "2.0.0", shared_2)
+            .with("sub", "1.2.0", &[])
+            .with("sub", "2.1.0", &[])
+    }
+
     #[test]
     fn a_replaced_version_withdraws_its_own_ranges() {
-        // shared@2.0.0 is picked first and asks for sub ^2; then b narrows shared to 1.x,
-        // which asks for sub ^1. The range of the replaced shared@2.0.0 must not linger.
-        let mut source = Fake::default()
-            .with("a", "1.0.0", &[("shared", "*")])
-            .with("b", "1.0.0", &[("shared", "<2.0.0")])
-            .with("shared", "1.5.0", &[("sub", "^1.0.0")])
-            .with("shared", "2.0.0", &[("sub", "^2.0.0")])
-            .with("sub", "1.2.0", &[])
-            .with("sub", "2.1.0", &[]);
-        let resolution = resolve(
-            &roots(&[("a", "*"), ("b", "*")]),
-            &mut source,
-            &Options::default(),
-        )
-        .unwrap();
+        // shared@2.0.0 asks for sub ^2; its replacement shared@1.5.0 asks for sub ^1. The
+        // range of the replaced version must not linger and cause a false conflict.
+        let mut source = narrowed_later(&[("sub", "^1.0.0")], &[("sub", "^2.0.0")]);
+        let resolution = resolve(&roots(&[("a", "*")]), &mut source, &Options::default()).unwrap();
         assert_eq!(
             versions(&resolution),
-            ["a@1.0.0", "b@1.0.0", "shared@1.5.0", "sub@1.2.0"]
+            [
+                "a@1.0.0",
+                "deep@1.0.0",
+                "mid@1.0.0",
+                "shared@1.5.0",
+                "sub@1.2.0"
+            ]
         );
     }
 
     #[test]
     fn a_conflict_that_a_later_replacement_lifts_is_not_an_error() {
-        // "sub" is first asked for as ^2 (by shared@2.0.0) and ^1 (by c): no version fits.
-        // Once b narrows shared to 1.x, the ^2 range is withdrawn and sub resolves.
-        let mut source = Fake::default()
-            .with("a", "1.0.0", &[("shared", "*")])
-            .with("c", "1.0.0", &[("sub", "^1.0.0")])
-            .with("z", "1.0.0", &[("shared", "<2.0.0")])
-            .with("shared", "1.5.0", &[])
-            .with("shared", "2.0.0", &[("sub", "^2.0.0")])
-            .with("sub", "1.2.0", &[])
-            .with("sub", "2.1.0", &[]);
+        // "sub" is asked for as ^2 (by shared@2.0.0) and ^1 (by c) before shared is
+        // narrowed: no version fits at that moment. Once shared moves to 1.x, it resolves.
+        let mut source =
+            narrowed_later(&[], &[("sub", "^2.0.0")]).with("c", "1.0.0", &[("sub", "^1.0.0")]);
         let resolution = resolve(
-            &roots(&[("a", "*"), ("c", "*"), ("z", "*")]),
+            &roots(&[("a", "*"), ("c", "*")]),
             &mut source,
             &Options::default(),
         )
         .unwrap();
         assert_eq!(
             versions(&resolution),
-            ["a@1.0.0", "c@1.0.0", "shared@1.5.0", "sub@1.2.0", "z@1.0.0"]
+            [
+                "a@1.0.0",
+                "c@1.0.0",
+                "deep@1.0.0",
+                "mid@1.0.0",
+                "shared@1.5.0",
+                "sub@1.2.0"
+            ]
         );
     }
 
     #[test]
-    fn a_dependency_skipped_for_a_replaced_version_is_not_reported() {
-        let mut source = Fake::default()
-            .with("a", "1.0.0", &[("shared", "*")])
-            .with("b", "1.0.0", &[("shared", "<2.0.0")])
-            .with("shared", "1.5.0", &[])
-            .with("shared", "2.0.0", &[("hidden", "*")]);
-        let resolution = resolve(
-            &roots(&[("a", "*"), ("b", "*")]),
-            &mut source,
-            &Options::default(),
-        )
-        .unwrap();
+    fn a_dependency_of_a_replaced_version_is_dropped() {
+        // Only shared@2.0.0 needed "sub" and the invisible "hidden"; neither is installed
+        // or reported once shared has moved to 1.x.
+        let mut source = narrowed_later(&[], &[("sub", "^2.0.0"), ("hidden", "*")]);
+        let resolution = resolve(&roots(&[("a", "*")]), &mut source, &Options::default()).unwrap();
         assert_eq!(
             versions(&resolution),
-            ["a@1.0.0", "b@1.0.0", "shared@1.5.0"]
+            ["a@1.0.0", "deep@1.0.0", "mid@1.0.0", "shared@1.5.0"]
         );
         assert!(resolution.skipped.is_empty());
     }
