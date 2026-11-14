@@ -72,6 +72,7 @@ ctx search handbook
 
 ctx publish ./team-handbook                      # a directory with a manifest.json
 ctx access grant team-handbook ana@example.dev @example.org
+ctx access trust team-handbook acme/handbook --workflow release.yml --ref refs/heads/main
 ```
 
 Packages land in `.ctx/packages/<name>/`. Both the directory and the paths inside a

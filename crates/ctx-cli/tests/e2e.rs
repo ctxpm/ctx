@@ -333,6 +333,66 @@ fn publish_install_update_and_access() {
         "base one-one\n"
     );
 
+    // A lockfile that no longer matches ctx.toml is refused instead of installed quietly.
+    let drifted = work.path().join("drifted");
+    fs::create_dir_all(&drifted).unwrap();
+    fs::copy(project.join("ctx.lock"), drifted.join("ctx.lock")).unwrap();
+    fs::write(
+        drifted.join("ctx.toml"),
+        format!("[packages]\n{app} = \"^9.0.0\"\n"),
+    )
+    .unwrap();
+    let mismatch = reader.fails(&drifted, &["install", "--frozen"]);
+    assert!(
+        mismatch.contains("ctx.lock does not match ctx.toml"),
+        "{mismatch}"
+    );
+    assert!(!drifted.join(".ctx").exists());
+
+    // --- Trusted publishers ------------------------------------------------------------
+    owner.ok(
+        cwd,
+        &[
+            "access",
+            "trust",
+            &app,
+            "Acme/Handbook",
+            "--workflow",
+            "release.yml",
+            "--ref",
+            "refs/heads/main",
+        ],
+    );
+    let trusted = owner.ok(cwd, &["access", "list", &app]).stdout;
+    assert!(
+        trusted.contains("acme/handbook  (workflow acme/handbook/.github/workflows/release.yml, ref refs/heads/main)"),
+        "{trusted}"
+    );
+    owner.ok(cwd, &["access", "trust", &app, "acme/handbook"]);
+    assert!(
+        owner
+            .ok(cwd, &["access", "list", &app])
+            .stdout
+            .contains("acme/handbook  (any workflow, any branch)")
+    );
+    assert!(
+        reader
+            .fails(cwd, &["access", "trust", &app, "mallory/repo"])
+            .contains("not a maintainer")
+    );
+    owner.ok(cwd, &["access", "untrust", &app, "acme/handbook"]);
+    assert!(
+        !owner
+            .ok(cwd, &["access", "list", &app])
+            .stdout
+            .contains("publisher:")
+    );
+    assert!(
+        owner
+            .fails(cwd, &["access", "untrust", &app, "acme/handbook"])
+            .contains("does not trust")
+    );
+
     // --- Yanking ----------------------------------------------------------------------
     owner.ok(cwd, &["yank", &format!("{base}@1.1.0")]);
     let fresh = work.path().join("fresh");

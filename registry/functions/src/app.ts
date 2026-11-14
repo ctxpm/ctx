@@ -43,8 +43,31 @@ export interface Deps {
 }
 
 const DIST_TAG = /^[a-z][a-z0-9-]{0,31}$/;
-/** Only this many file entries are stored on a version document; the artifact has them all. */
-const MAX_LISTED_FILES = 2000;
+/**
+ * The file list stored on a version document is cut off at this many entries and this many
+ * characters of path, so the document stays well under Firestore's 1 MiB limit. The
+ * artifact always has every file.
+ */
+const MAX_LISTED_FILES = 1000;
+const MAX_LISTED_PATH_CHARS = 200_000;
+
+function listedFiles(files: { path: string; size: number }[]): { path: string; size: number }[] {
+  const listed: { path: string; size: number }[] = [];
+  let characters = 0;
+  for (const file of files) {
+    characters += file.path.length + 32;
+    if (listed.length >= MAX_LISTED_FILES || characters > MAX_LISTED_PATH_CHARS) {
+      break;
+    }
+    listed.push(file);
+  }
+  return listed;
+}
+
+/** True when a Storage write failed because the object already exists. */
+function alreadyExists(error: unknown): boolean {
+  return (error as { code?: number }).code === 412;
+}
 
 function publisherOf(caller: Caller): Record<string, unknown> {
   return caller.kind === 'user'
@@ -210,17 +233,34 @@ async function publish(req: ApiRequest, deps: Deps): Promise<unknown> {
     }
   };
 
+  const versionExists = (): ApiError =>
+    new ApiError(409, 'version_exists', `${manifest.name}@${manifest.version} is already published; versions are immutable`);
+
   // Check before storing anything, then again inside the transaction.
   authorize((await pkgRef.get()).data());
+  if ((await versionRef.get()).exists) {
+    throw versionExists();
+  }
 
   const sha256 = createHash('sha256').update(req.body).digest('hex');
-  // The object name contains the digest, so different bytes can never replace a published artifact.
+  // The object name contains the digest, so different bytes can never replace a published
+  // artifact, and the write only succeeds when the object does not exist yet.
   const artifact = `packages/${manifest.name}/${manifest.version}/${sha256}.tgz`;
-  await bucket.file(artifact).save(req.body, {
-    resumable: false,
-    contentType: 'application/gzip',
-    metadata: { metadata: { sha256, package: manifest.name, version: manifest.version } },
-  });
+  let uploaded = true;
+  try {
+    await bucket.file(artifact).save(req.body, {
+      resumable: false,
+      contentType: 'application/gzip',
+      metadata: { metadata: { sha256, package: manifest.name, version: manifest.version } },
+      preconditionOpts: { ifGenerationMatch: 0 },
+    });
+  } catch (error) {
+    if (!alreadyExists(error)) {
+      throw error;
+    }
+    // Same name means same bytes: another request stored this exact archive already.
+    uploaded = false;
+  }
 
   try {
     return await db.runTransaction(async (tx) => {
@@ -229,11 +269,7 @@ async function publish(req: ApiRequest, deps: Deps): Promise<unknown> {
       const pkg = pkgSnapshot.data();
       authorize(pkg);
       if (versionSnapshot.exists) {
-        throw new ApiError(
-          409,
-          'version_exists',
-          `${manifest.name}@${manifest.version} is already published; versions are immutable`,
-        );
+        throw versionExists();
       }
 
       const distTags: Record<string, string> = { ...((pkg?.distTags as Record<string, string> | undefined) ?? {}) };
@@ -286,7 +322,7 @@ async function publish(req: ApiRequest, deps: Deps): Promise<unknown> {
         size: req.body.length,
         unpackedSize: info.unpackedSize,
         fileCount: info.files.length,
-        files: info.files.slice(0, MAX_LISTED_FILES),
+        files: listedFiles(info.files),
         readme: info.readme,
         yanked: false,
         publishedBy: publisherOf(caller),
@@ -301,13 +337,20 @@ async function publish(req: ApiRequest, deps: Deps): Promise<unknown> {
       };
     });
   } catch (error) {
-    // Remove the upload unless it is the artifact of the published version (same bytes, same name).
-    const published = await versionRef.get().catch(() => undefined);
-    if (published?.data()?.artifact !== artifact) {
-      await bucket
-        .file(artifact)
-        .delete({ ignoreNotFound: true })
-        .catch((cleanupError: unknown) => deps.log(`Could not remove ${artifact}`, cleanupError));
+    // Clean up only in the one case that is certain: this request stored the archive, lost
+    // to a version that is published with a different archive, and that could be read
+    // back. In every other case the object stays; an unreferenced archive is harmless,
+    // a deleted published one is not.
+    if (uploaded && error instanceof ApiError && error.code === 'version_exists') {
+      try {
+        const published = await versionRef.get();
+        const publishedArtifact = published.data()?.artifact;
+        if (published.exists && typeof publishedArtifact === 'string' && publishedArtifact !== artifact) {
+          await bucket.file(artifact).delete({ ignoreNotFound: true });
+        }
+      } catch (cleanupError) {
+        deps.log(`Left ${artifact} in place; could not confirm it is unused`, cleanupError);
+      }
     }
     throw error;
   }

@@ -12,6 +12,36 @@ use serde_json::{Map, Value, json};
 use crate::descriptor::Descriptor;
 use crate::error::{Result, err};
 
+/// Fields of a version document the CLI reads.
+const VERSION_FIELDS: [&str; 12] = [
+    "name",
+    "version",
+    "type",
+    "description",
+    "dependencies",
+    "integrity",
+    "artifact",
+    "archivePrefix",
+    "size",
+    "yanked",
+    "publishedAt",
+    "publishedBy",
+];
+
+/// A CI workflow that may publish a package. Only `repository` is required; every other
+/// field that is set must match the publishing job.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct TrustedPublisher {
+    pub provider: String,
+    pub repository: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+}
+
 /// A package as listed in the registry index.
 #[derive(Debug, Clone)]
 pub struct PackageInfo {
@@ -24,6 +54,7 @@ pub struct PackageInfo {
     pub readers: Vec<String>,
     pub reader_domains: Vec<String>,
     pub maintainers: Vec<String>,
+    pub trusted_publishers: Vec<TrustedPublisher>,
     pub version_count: u64,
 }
 
@@ -141,6 +172,16 @@ fn package_from(data: &Value) -> PackageInfo {
         readers: strings(data, "readers"),
         reader_domains: strings(data, "readerDomains"),
         maintainers: strings(data, "maintainers"),
+        trusted_publishers: data
+            .get("trustedPublishers")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default(),
         version_count: data
             .get("versionCount")
             .and_then(Value::as_u64)
@@ -285,7 +326,9 @@ impl Registry {
         loop {
             let mut request = self
                 .authorized(self.http.get(&base))
-                .query(&[("pageSize", "300")]);
+                .query(&[("pageSize", "300")])
+                // Only what resolving and listing need; READMEs and file lists stay behind.
+                .query(&VERSION_FIELDS.map(|field| ("mask.fieldPaths", field)));
             if let Some(token) = &page_token {
                 request = request.query(&[("pageToken", token.as_str())]);
             }
@@ -474,15 +517,26 @@ impl Registry {
     }
 }
 
-/// Converts plain JSON (strings and lists of strings) to a Firestore REST value.
+/// Converts plain JSON to a Firestore REST value.
 fn firestore_value(value: &Value) -> Value {
     match value {
+        Value::Null => json!({ "nullValue": null }),
         Value::String(text) => json!({ "stringValue": text }),
+        Value::Bool(flag) => json!({ "booleanValue": flag }),
+        Value::Number(number) if number.is_i64() || number.is_u64() => {
+            json!({ "integerValue": number.to_string() })
+        }
+        Value::Number(number) => json!({ "doubleValue": number }),
         Value::Array(items) => {
             json!({ "arrayValue": { "values": items.iter().map(firestore_value).collect::<Vec<_>>() } })
         }
-        Value::Bool(flag) => json!({ "booleanValue": flag }),
-        other => json!({ "stringValue": other.to_string() }),
+        Value::Object(entries) => {
+            let fields: Map<String, Value> = entries
+                .iter()
+                .map(|(key, value)| (key.clone(), firestore_value(value)))
+                .collect();
+            json!({ "mapValue": { "fields": fields } })
+        }
     }
 }
 
@@ -544,6 +598,29 @@ mod tests {
             ))
             .is_none()
         );
+    }
+
+    #[test]
+    fn firestore_values_round_trip_through_plain_json() {
+        let original = json!({
+            "trustedPublishers": [
+                { "provider": "github", "repository": "acme/handbook", "ref": "refs/heads/main" }
+            ],
+            "readers": ["a@example.dev"],
+            "count": 3,
+            "open": false,
+        });
+        let document = json!({ "fields": firestore_value(&original)["mapValue"]["fields"] });
+        assert_eq!(fields(&document), original);
+
+        let package = package_from(&fields(&document));
+        assert_eq!(package.trusted_publishers.len(), 1);
+        assert_eq!(package.trusted_publishers[0].repository, "acme/handbook");
+        assert_eq!(
+            package.trusted_publishers[0].git_ref.as_deref(),
+            Some("refs/heads/main")
+        );
+        assert_eq!(package.trusted_publishers[0].workflow, None);
     }
 
     #[test]

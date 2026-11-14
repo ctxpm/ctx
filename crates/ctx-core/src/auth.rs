@@ -210,10 +210,17 @@ fn wait_for_redirect(listener: TcpListener) -> Result<Vec<(String, String)>> {
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                stream.set_nonblocking(false)?;
-                stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+                // Browsers open spare connections that never send anything. A connection
+                // that fails or stays silent is dropped; only the redirect ends the wait.
                 let mut request_line = String::new();
-                BufReader::new(&stream).read_line(&mut request_line)?;
+                let readable = stream.set_nonblocking(false).is_ok()
+                    && stream
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .is_ok()
+                    && BufReader::new(&stream).read_line(&mut request_line).is_ok();
+                if !readable || request_line.trim().is_empty() {
+                    continue;
+                }
                 let target = request_line
                     .split_whitespace()
                     .nth(1)
@@ -338,6 +345,34 @@ pub fn sign_in_with_browser(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
+
+    #[test]
+    fn the_login_listener_ignores_idle_and_unrelated_connections() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiting = std::thread::spawn(move || wait_for_redirect(listener));
+
+        // A spare connection that is closed without a request, as browsers make.
+        drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        // One that stays open and silent for longer than the read timeout.
+        let idle = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        // A request that is not the redirect.
+        let mut favicon = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        favicon
+            .write_all(b"GET /favicon.ico HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        // The redirect itself.
+        let mut redirect = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        redirect
+            .write_all(b"GET /?state=abc&code=4%2Fxyz HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+
+        let params = waiting.join().unwrap().unwrap();
+        assert!(params.contains(&("code".to_string(), "4/xyz".to_string())));
+        assert!(params.contains(&("state".to_string(), "abc".to_string())));
+        drop(idle);
+    }
 
     fn token(claims: Value) -> String {
         format!(

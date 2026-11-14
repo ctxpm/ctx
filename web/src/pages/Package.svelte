@@ -23,6 +23,8 @@
   let saving = $state(false);
   let grant = $state('');
   let trust = $state('');
+  let trustRef = $state('refs/heads/main');
+  let trustWorkflow = $state('');
   let dependencyTypes = $state<Record<string, string>>({});
 
   async function load() {
@@ -108,9 +110,17 @@
       problem = 'Enter a GitHub repository as owner/repo.';
       return;
     }
-    if (!pkg.trustedPublishers.some((entry) => entry.repository === repository)) {
-      void change({ trustedPublishers: [...pkg.trustedPublishers, { provider: 'github', repository }] });
-    }
+    // A bare file name means a workflow in the trusted repository itself.
+    const file = trustWorkflow.trim().toLowerCase();
+    const publisher = {
+      provider: 'github' as const,
+      repository,
+      ...(file ? { workflow: file.includes('/') ? file : `${repository}/.github/workflows/${file}` } : {}),
+      ...(trustRef.trim() ? { ref: trustRef.trim() } : {}),
+    };
+    void change({
+      trustedPublishers: [...pkg.trustedPublishers.filter((entry) => entry.repository !== repository), publisher],
+    });
     trust = '';
   }
 
@@ -288,9 +298,9 @@
               <li>
                 <span>
                   {publisher.repository}
-                  {#if publisher.workflow || publisher.ref}
-                    <span class="small muted">{[publisher.workflow?.split('/').pop(), publisher.ref].filter(Boolean).join(', ')}</span>
-                  {/if}
+                  <span class="small muted">
+                    {[publisher.workflow?.split('/').pop(), publisher.ref].filter(Boolean).join(', ') || 'any workflow, any branch'}
+                  </span>
                 </span>
                 <button class="button plain small" disabled={saving} onclick={() => change({ trustedPublishers: pkg!.trustedPublishers.filter((entry) => entry !== publisher) })}>
                   Remove<span class="visually-hidden"> {publisher.repository}</span>
@@ -302,7 +312,16 @@
             <label class="visually-hidden" for="trust">GitHub repository whose workflows may publish</label>
             <input id="trust" class="field" bind:value={trust} placeholder="owner/repo" autocomplete="off" />
             <button class="button" disabled={saving || trust.trim() === ''}>Trust repository</button>
+            <label class="limit small">
+              <span>Only from this branch or tag</span>
+              <input class="field" bind:value={trustRef} placeholder="any ref" autocomplete="off" />
+            </label>
+            <label class="limit small">
+              <span>Only this workflow file</span>
+              <input class="field" bind:value={trustWorkflow} placeholder="any workflow, for example release.yml" autocomplete="off" />
+            </label>
           </form>
+          <p class="small muted">Leave a limit empty to accept any. Without limits, every branch of the repository can publish.</p>
         </section>
       {/if}
     </aside>
@@ -600,6 +619,17 @@
 
   .add .field {
     flex: 1;
+  }
+
+  .add:has(.limit) {
+    flex-wrap: wrap;
+  }
+
+  .limit {
+    display: grid;
+    gap: 0.2rem;
+    flex: 1 1 100%;
+    color: var(--ink-soft);
   }
 
   @media (max-width: 58rem) {

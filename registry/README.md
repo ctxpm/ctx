@@ -65,7 +65,9 @@ Publishing a version that already exists returns `409`; versions are immutable. 
 ```
 
 Only `provider` and `repository` are required. Every field that is set must match the
-token of the publishing job. A CI job can publish new versions of a package that trusts
+token of the publishing job. Without `ref` and `workflow`, any workflow on any branch of
+the repository can publish, so pin both: `ctx access trust <package> owner/repo
+--workflow release.yml --ref refs/heads/main`. A CI job can publish new versions of a package that trusts
 it; it can never create a package or yank a version.
 
 ## Settings
