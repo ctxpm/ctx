@@ -230,7 +230,56 @@ fn publish_install_update_and_access() {
             .contains(&reader_email)
     );
     let not_yours = reader.fails(cwd, &["access", "grant", &app, "someone@example.dev"]);
-    assert!(not_yours.contains("not a maintainer"), "{not_yours}");
+    assert!(not_yours.contains("only maintainers"), "{not_yours}");
+    // A reader can use the package but cannot see who else has access.
+    assert!(
+        reader
+            .fails(cwd, &["access", "list", &app])
+            .contains("only maintainers")
+    );
+    assert!(
+        !reader
+            .ok(cwd, &["info", &app])
+            .stdout
+            .contains("maintainers:")
+    );
+    assert!(
+        owner
+            .ok(cwd, &["info", &app])
+            .stdout
+            .contains(&format!("maintainers: {owner_email}"))
+    );
+
+    // Handing a package over: a second maintainer can change access, and a removed one cannot.
+    owner.ok(
+        cwd,
+        &["access", "grant", &base, &reader_email, "--maintainer"],
+    );
+    reader.ok(cwd, &["access", "grant", &base, "third@example.dev"]);
+    assert!(
+        owner
+            .ok(cwd, &["access", "list", &base])
+            .stdout
+            .contains("third@example.dev")
+    );
+    owner.ok(
+        cwd,
+        &["access", "revoke", &base, &reader_email, "--maintainer"],
+    );
+    assert!(
+        reader
+            .fails(cwd, &["access", "revoke", &base, "third@example.dev"])
+            .contains("only maintainers")
+    );
+    owner.ok(cwd, &["access", "revoke", &base, "third@example.dev"]);
+    assert!(
+        owner
+            .fails(
+                cwd,
+                &["access", "revoke", &base, &owner_email, "--maintainer"]
+            )
+            .contains("at least one maintainer")
+    );
 
     // --- Installing -------------------------------------------------------------------
     let installed = reader.ok(&project, &["install", &app]);
@@ -378,7 +427,7 @@ fn publish_install_update_and_access() {
     assert!(
         reader
             .fails(cwd, &["access", "trust", &app, "mallory/repo"])
-            .contains("not a maintainer")
+            .contains("only maintainers")
     );
     owner.ok(cwd, &["access", "untrust", &app, "acme/handbook"]);
     assert!(

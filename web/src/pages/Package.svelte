@@ -1,12 +1,14 @@
 <script lang="ts">
   import { formatBytes, formatDate, renderMarkdown } from '../lib/markdown';
   import {
+    getAccess,
     getPackage,
     getVersions,
     hueOf,
     session,
     setYanked,
     updateAccess,
+    type Access,
     type AccessChange,
     type Package,
     type Version,
@@ -15,6 +17,9 @@
   let { name }: { name: string } = $props();
 
   let pkg = $state<Package | null>(null);
+  // Present only for maintainers: nobody else receives the access lists.
+  let access = $state<Access | null>(null);
+  let owner = $state('');
   let versions = $state<Version[]>([]);
   let loading = $state(true);
   let problem = $state('');
@@ -31,7 +36,7 @@
     loading = true;
     try {
       pkg = await getPackage(name);
-      versions = pkg ? await getVersions(name) : [];
+      [versions, access] = pkg ? await Promise.all([getVersions(name), getAccess(name)]) : [[], null];
     } catch (error) {
       problem = `This package could not be loaded: ${(error as Error).message}`;
     }
@@ -50,7 +55,7 @@
   const command = $derived(`ctx install ${name}${shown && !isLatest ? `@${shown.version}` : ''}`);
   const readme = $derived(shown?.readme ? renderMarkdown(shown.readme) : '');
   const dependencies = $derived(Object.entries(shown?.dependencies ?? {}));
-  const maintainer = $derived(session.email !== null && (pkg?.maintainers.includes(session.email) ?? false));
+  const maintainer = $derived(access !== null);
 
   // Colour each dependency layer by its own type, when the visitor may see that package.
   $effect(() => {
@@ -69,30 +74,46 @@
   }
 
   async function change(update: AccessChange) {
-    if (!pkg) {
+    if (!pkg || !access) {
       return;
     }
     saving = true;
     problem = '';
     try {
       await updateAccess(pkg.name, update);
-      pkg = { ...pkg, ...update };
+      // Read back what the registry stored: it normalises and de-duplicates entries.
+      access = await getAccess(pkg.name);
+      pkg = { ...pkg, visibility: access?.visibility ?? pkg.visibility };
     } catch (error) {
       problem = `The change was not saved: ${(error as Error).message}`;
     }
     saving = false;
   }
 
+  function addMaintainer(event: SubmitEvent) {
+    event.preventDefault();
+    if (!access) {
+      return;
+    }
+    const entry = owner.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(entry)) {
+      problem = 'Enter the email address of the new maintainer.';
+      return;
+    }
+    void change({ maintainers: [...new Set([...access.maintainers, entry])] });
+    owner = '';
+  }
+
   function addReader(event: SubmitEvent) {
     event.preventDefault();
-    if (!pkg) {
+    if (!access) {
       return;
     }
     const entry = grant.trim().toLowerCase();
     if (entry.startsWith('@') && entry.length > 3) {
-      void change({ readerDomains: [...new Set([...pkg.readerDomains, entry.slice(1)])] });
+      void change({ readerDomains: [...new Set([...access.readerDomains, entry.slice(1)])] });
     } else if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(entry)) {
-      void change({ readers: [...new Set([...pkg.readers, entry])] });
+      void change({ readers: [...new Set([...access.readers, entry])] });
     } else {
       problem = 'Enter an email address, or a domain written as @example.org.';
       return;
@@ -102,7 +123,7 @@
 
   function addPublisher(event: SubmitEvent) {
     event.preventDefault();
-    if (!pkg) {
+    if (!access) {
       return;
     }
     const repository = trust.trim().toLowerCase();
@@ -119,7 +140,7 @@
       ...(trustRef.trim() ? { ref: trustRef.trim() } : {}),
     };
     void change({
-      trustedPublishers: [...pkg.trustedPublishers.filter((entry) => entry.repository !== repository), publisher],
+      trustedPublishers: [...access.trustedPublishers.filter((entry) => entry.repository !== repository), publisher],
     });
     trust = '';
   }
@@ -248,35 +269,37 @@
         </details>
       {/if}
 
-      {#if maintainer}
+      {#if access}
         <section aria-labelledby="access-title" class="access">
           <h2 id="access-title">Who can read this</h2>
 
           <div class="choice" role="group" aria-label="Visibility">
-            <button class="button" class:primary={pkg.visibility === 'restricted'} disabled={saving} onclick={() => change({ visibility: 'restricted' })}>
+            <button class="button" class:primary={access.visibility === 'restricted'} disabled={saving} onclick={() => change({ visibility: 'restricted' })}>
               Only people listed here
             </button>
-            <button class="button" class:primary={pkg.visibility === 'public'} disabled={saving} onclick={() => change({ visibility: 'public' })}>
+            <button class="button" class:primary={access.visibility === 'public'} disabled={saving} onclick={() => change({ visibility: 'public' })}>
               Anyone
             </button>
           </div>
 
+          {#if access.readers.length === 0 && access.readerDomains.length === 0}
+            <p class="small muted">
+              {access.visibility === 'public' ? 'Everyone can read this package.' : 'Nobody but the maintainers yet.'}
+            </p>
+          {/if}
           <ul class="people">
-            {#each pkg.maintainers as person (person)}
-              <li><span>{person}</span><span class="small muted">maintainer</span></li>
-            {/each}
-            {#each pkg.readers as person (person)}
+            {#each access.readers as person (person)}
               <li>
                 <span>{person}</span>
-                <button class="button plain small" disabled={saving} onclick={() => change({ readers: pkg!.readers.filter((entry) => entry !== person) })}>
+                <button class="button plain small" disabled={saving} onclick={() => change({ readers: access!.readers.filter((entry) => entry !== person) })}>
                   Remove<span class="visually-hidden"> {person}</span>
                 </button>
               </li>
             {/each}
-            {#each pkg.readerDomains as domain (domain)}
+            {#each access.readerDomains as domain (domain)}
               <li>
                 <span>Everyone at {domain}</span>
-                <button class="button plain small" disabled={saving} onclick={() => change({ readerDomains: pkg!.readerDomains.filter((entry) => entry !== domain) })}>
+                <button class="button plain small" disabled={saving} onclick={() => change({ readerDomains: access!.readerDomains.filter((entry) => entry !== domain) })}>
                   Remove<span class="visually-hidden"> {domain}</span>
                 </button>
               </li>
@@ -289,12 +312,35 @@
             <button class="button" disabled={saving || grant.trim() === ''}>Give access</button>
           </form>
 
+          <h3>Maintainers</h3>
+          <p class="small muted">Maintainers publish versions and decide who has access.</p>
+          <ul class="people">
+            {#each access.maintainers as person (person)}
+              <li>
+                <span>{person}{person === session.email ? ' (you)' : ''}</span>
+                <button
+                  class="button plain small"
+                  disabled={saving || access.maintainers.length === 1}
+                  title={access.maintainers.length === 1 ? 'A package needs at least one maintainer' : undefined}
+                  onclick={() => change({ maintainers: access!.maintainers.filter((entry) => entry !== person) })}
+                >
+                  Remove<span class="visually-hidden"> {person} as maintainer</span>
+                </button>
+              </li>
+            {/each}
+          </ul>
+          <form class="add" onsubmit={addMaintainer}>
+            <label class="visually-hidden" for="owner">Email address of a new maintainer</label>
+            <input id="owner" class="field" bind:value={owner} placeholder="ana@example.org" autocomplete="off" />
+            <button class="button" disabled={saving || owner.trim() === ''}>Add maintainer</button>
+          </form>
+
           <h3>Workflows that may publish</h3>
-          {#if pkg.trustedPublishers.length === 0}
+          {#if access.trustedPublishers.length === 0}
             <p class="small muted">None. Only maintainers can publish, from their own machine.</p>
           {/if}
           <ul class="people">
-            {#each pkg.trustedPublishers as publisher (publisher.repository + (publisher.workflow ?? ''))}
+            {#each access.trustedPublishers as publisher (publisher.repository + (publisher.workflow ?? ''))}
               <li>
                 <span>
                   {publisher.repository}
@@ -302,7 +348,7 @@
                     {[publisher.workflow?.split('/').pop(), publisher.ref].filter(Boolean).join(', ') || 'any workflow, any branch'}
                   </span>
                 </span>
-                <button class="button plain small" disabled={saving} onclick={() => change({ trustedPublishers: pkg!.trustedPublishers.filter((entry) => entry !== publisher) })}>
+                <button class="button plain small" disabled={saving} onclick={() => change({ trustedPublishers: access!.trustedPublishers.filter((entry) => entry.repository !== publisher.repository) })}>
                   Remove<span class="visually-hidden"> {publisher.repository}</span>
                 </button>
               </li>

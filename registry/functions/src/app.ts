@@ -5,6 +5,7 @@ import semver from 'semver';
 import {
   accessOf,
   configOf,
+  type PackageAccess,
   isMaintainer,
   mayCreate,
   mayPublish,
@@ -16,6 +17,7 @@ import {
 import type { Caller, Identify } from './auth.js';
 import { ApiError } from './errors.js';
 import { isExactVersion, isPackageName, ManifestError, PACKAGE_TYPE, parseManifest } from './manifest.js';
+import { accessRef, writeAccess } from './store.js';
 import { DEFAULT_LIMITS, inspectTarball, TarballError } from './tarball.js';
 
 export interface ApiRequest {
@@ -100,36 +102,24 @@ async function loadConfig(db: Firestore) {
   return configOf(snapshot.data());
 }
 
-/** Fields of a new package document. The creator always becomes a maintainer. */
-function newPackage(
-  name: string,
-  type: string,
-  description: string,
-  creatorEmail: string,
-  access: {
-    visibility: 'public' | 'restricted';
-    readers: string[];
-    readerDomains: string[];
-    maintainers: string[];
-    trustedPublishers: unknown[];
-  },
-): Record<string, unknown> {
+/** Fields of a new package document: what readers see. Access lives in its own document. */
+function newPackage(name: string, type: string, description: string, visibility: 'public' | 'restricted'): Record<string, unknown> {
   return {
     name,
     type,
     description,
-    visibility: access.visibility,
-    readers: access.readers,
-    readerDomains: access.readerDomains,
-    maintainers: [...new Set([creatorEmail, ...access.maintainers])],
-    trustedPublishers: access.trustedPublishers,
+    visibility,
     distTags: {},
     latestVersion: null,
     versionCount: 0,
-    createdBy: creatorEmail,
     createdAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
   };
+}
+
+/** Access of a new package: the creator always becomes a maintainer. */
+function initialAccess(creatorEmail: string, access: PackageAccess): PackageAccess {
+  return { ...access, maintainers: [...new Set([creatorEmail, ...access.maintainers])] };
 }
 
 /** POST /v1/packages — claim a package name and set its access before the first publish. */
@@ -159,16 +149,18 @@ async function createPackage(req: ApiRequest, deps: Deps): Promise<unknown> {
     throw new ApiError(403, 'forbidden', 'You are not allowed to create packages in this registry');
   }
 
-  const ref = deps.db.collection('packages').doc(input.name);
-  try {
-    await ref.create(newPackage(input.name, input.type, description, caller.email, access));
-  } catch (error) {
-    if ((error as { code?: number }).code === 6) {
-      throw new ApiError(409, 'package_exists', `Package "${input.name}" already exists`);
+  const name = input.name;
+  const type = input.type;
+  const email = caller.email;
+  const ref = deps.db.collection('packages').doc(name);
+  await deps.db.runTransaction(async (tx) => {
+    if ((await tx.get(ref)).exists) {
+      throw new ApiError(409, 'package_exists', `Package "${name}" already exists`);
     }
-    throw error;
-  }
-  return { name: input.name };
+    tx.create(ref, newPackage(name, type, description, access.visibility));
+    writeAccess(tx, deps.db, name, undefined, initialAccess(email, access), email);
+  });
+  return { name };
 }
 
 /** POST /v1/publish — body is the .tgz; name and version come from its manifest.json. */
@@ -209,7 +201,7 @@ async function publish(req: ApiRequest, deps: Deps): Promise<unknown> {
   const config = await loadConfig(db);
 
   /** Throws unless the caller may publish this manifest given the current package document. */
-  const authorize = (pkg: Record<string, unknown> | undefined): void => {
+  const authorize = (pkg: Record<string, unknown> | undefined, access: Record<string, unknown> | undefined): void => {
     if (pkg === undefined) {
       if (!mayCreate(caller, config)) {
         throw new ApiError(
@@ -220,7 +212,7 @@ async function publish(req: ApiRequest, deps: Deps): Promise<unknown> {
       }
       return;
     }
-    if (!mayPublish(caller, accessOf(pkg))) {
+    if (!mayPublish(caller, accessOf(access ?? {}))) {
       // Do not reveal whether a package exists to someone who cannot publish to it.
       throw new ApiError(403, 'forbidden', `You are not allowed to publish "${manifest.name}"`);
     }
@@ -237,7 +229,7 @@ async function publish(req: ApiRequest, deps: Deps): Promise<unknown> {
     new ApiError(409, 'version_exists', `${manifest.name}@${manifest.version} is already published; versions are immutable`);
 
   // Check before storing anything, then again inside the transaction.
-  authorize((await pkgRef.get()).data());
+  authorize((await pkgRef.get()).data(), (await accessRef(db, manifest.name).get()).data());
   if ((await versionRef.get()).exists) {
     throw versionExists();
   }
@@ -266,8 +258,9 @@ async function publish(req: ApiRequest, deps: Deps): Promise<unknown> {
     return await db.runTransaction(async (tx) => {
       const pkgSnapshot = await tx.get(pkgRef);
       const versionSnapshot = await tx.get(versionRef);
+      const accessSnapshot = await tx.get(accessRef(db, manifest.name));
       const pkg = pkgSnapshot.data();
-      authorize(pkg);
+      authorize(pkg, accessSnapshot.data());
       if (versionSnapshot.exists) {
         throw versionExists();
       }
@@ -287,17 +280,19 @@ async function publish(req: ApiRequest, deps: Deps): Promise<unknown> {
         // authorize() only lets a signed-in user get here.
         const email = caller.kind === 'user' ? caller.email : '';
         tx.create(pkgRef, {
-          ...newPackage(manifest.name, manifest.type, manifest.description, email, {
-            visibility: 'restricted',
-            readers: [],
-            readerDomains: [],
-            maintainers: [],
-            trustedPublishers: [],
-          }),
+          ...newPackage(manifest.name, manifest.type, manifest.description, 'restricted'),
           distTags,
           latestVersion,
           versionCount: 1,
         });
+        const access = initialAccess(email, {
+          visibility: 'restricted',
+          readers: [],
+          readerDomains: [],
+          maintainers: [],
+          trustedPublishers: [],
+        });
+        writeAccess(tx, db, manifest.name, undefined, access, email);
       } else {
         tx.update(pkgRef, {
           distTags,
@@ -372,8 +367,9 @@ async function yank(req: ApiRequest, deps: Deps, name: string, version: string):
 
   return deps.db.runTransaction(async (tx) => {
     const pkgSnapshot = await tx.get(pkgRef);
+    const accessSnapshot = await tx.get(accessRef(deps.db, name));
     const pkg = pkgSnapshot.data();
-    if (pkg === undefined || !isMaintainer(caller, accessOf(pkg))) {
+    if (pkg === undefined || !isMaintainer(caller, accessOf(accessSnapshot.data() ?? {}))) {
       throw new ApiError(403, 'forbidden', `You are not allowed to change "${name}"`);
     }
     const versions = await tx.get(pkgRef.collection('versions').select('yanked'));
@@ -397,6 +393,50 @@ async function yank(req: ApiRequest, deps: Deps, name: string, version: string):
     tx.update(versionRef, { yanked });
     tx.update(pkgRef, { distTags, updatedAt: FieldValue.serverTimestamp() });
     return { name, version, yanked, distTags };
+  });
+}
+
+/**
+ * PATCH /v1/packages/{name}/access — replaces any of visibility, readers, readerDomains,
+ * maintainers and trustedPublishers. Maintainers only.
+ */
+async function updateAccess(req: ApiRequest, deps: Deps, name: string): Promise<unknown> {
+  const caller = await deps.identify(req.authorization);
+  const input = parseJson(req.body);
+  const known = ['visibility', 'readers', 'readerDomains', 'maintainers', 'trustedPublishers'];
+  const unknown = Object.keys(input).filter((key) => !known.includes(key));
+  if (unknown.length > 0) {
+    throw new ApiError(400, 'invalid_request', `Unknown field: ${unknown.join(', ')}`);
+  }
+  if (Object.keys(input).length === 0) {
+    throw new ApiError(400, 'invalid_request', `Nothing to change; send one of ${known.join(', ')}`);
+  }
+  // Parse before touching the database, so a malformed request changes nothing.
+  const change: Partial<PackageAccess> = {
+    ...(input.visibility !== undefined ? { visibility: parseVisibility(input.visibility) } : {}),
+    ...(input.readers !== undefined ? { readers: parseEmails(input.readers, 'readers', 500) } : {}),
+    ...(input.readerDomains !== undefined ? { readerDomains: parseDomains(input.readerDomains, 'readerDomains', 100) } : {}),
+    ...(input.maintainers !== undefined ? { maintainers: parseEmails(input.maintainers, 'maintainers', 100) } : {}),
+    ...(input.trustedPublishers !== undefined ? { trustedPublishers: parseTrustedPublishers(input.trustedPublishers) } : {}),
+  };
+  if (change.maintainers !== undefined && change.maintainers.length === 0) {
+    throw new ApiError(400, 'invalid_request', 'A package needs at least one maintainer');
+  }
+
+  const { db } = deps;
+  const pkgRef = db.collection('packages').doc(name);
+  return db.runTransaction(async (tx) => {
+    const pkgSnapshot = isPackageName(name) ? await tx.get(pkgRef) : undefined;
+    const accessSnapshot = isPackageName(name) ? await tx.get(accessRef(db, name)) : undefined;
+    const previous = accessOf(accessSnapshot?.data() ?? {});
+    if (caller.kind !== 'user' || !pkgSnapshot?.exists || !isMaintainer(caller, previous)) {
+      // The same answer whether the package exists or not.
+      throw new ApiError(403, 'forbidden', `You are not allowed to change "${name}"`);
+    }
+    const next: PackageAccess = { ...previous, ...change };
+    writeAccess(tx, db, name, previous, next, caller.email);
+    tx.update(pkgRef, { visibility: next.visibility, updatedAt: FieldValue.serverTimestamp() });
+    return { name, ...next };
   });
 }
 
@@ -431,6 +471,9 @@ export async function handle(req: ApiRequest, deps: Deps): Promise<ApiResponse> 
       route[4] === 'yank'
     ) {
       return { status: 200, body: await yank(req, deps, route[1] ?? '', route[3] ?? '') };
+    }
+    if (req.method === 'PATCH' && route.length === 3 && route[0] === 'packages' && route[2] === 'access') {
+      return { status: 200, body: await updateAccess(req, deps, route[1] ?? '') };
     }
     throw new ApiError(404, 'not_found', 'Unknown route');
   } catch (error) {

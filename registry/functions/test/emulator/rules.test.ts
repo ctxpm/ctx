@@ -29,21 +29,12 @@ let stranger: RulesTestContext;
 let unverifiedReader: RulesTestContext;
 let anonymous: RulesTestContext;
 
-function packageData(name: string, visibility: 'public' | 'restricted') {
-  return {
-    name,
-    type: 'project',
-    description: 'rules fixture',
-    visibility,
-    readers: ['reader@example.dev'],
-    readerDomains: ['acme.dev'],
-    maintainers: ['owner@example.dev'],
-    trustedPublishers: [],
-    distTags: { latest: '1.0.0' },
-    latestVersion: '1.0.0',
-    versionCount: 1,
-  };
-}
+const ACCESS = {
+  readers: ['reader@example.dev'],
+  readerDomains: ['acme.dev'],
+  maintainers: ['owner@example.dev'],
+  trustedPublishers: [{ provider: 'github', repository: 'acme/private-repo' }],
+};
 
 beforeAll(async () => {
   env = await initializeTestEnvironment({
@@ -69,9 +60,25 @@ beforeAll(async () => {
       [RESTRICTED, 'restricted'],
       [PUBLIC, 'public'],
     ] as const) {
-      await setDoc(doc(db, 'packages', name), packageData(name, visibility));
+      await setDoc(doc(db, 'packages', name), {
+        name,
+        type: 'project',
+        description: 'rules fixture',
+        visibility,
+        distTags: { latest: '1.0.0' },
+        latestVersion: '1.0.0',
+        versionCount: 1,
+      });
+      await setDoc(doc(db, 'packages', name, 'private', 'access'), { visibility, ...ACCESS });
       await setDoc(doc(db, 'packages', name, 'versions', '1.0.0'), { name, version: '1.0.0', yanked: false });
       await uploadBytes(ref(storage, `packages/${name}/${ARTIFACT}`), new Uint8Array([1, 2, 3]));
+      for (const [kind, principal] of [
+        ['reader', 'reader@example.dev'],
+        ['domain', 'acme.dev'],
+        ['maintainer', 'owner@example.dev'],
+      ] as const) {
+        await setDoc(doc(db, 'grants', `${name}|${kind}|${principal}`), { package: name, kind, principal });
+      }
     }
     await setDoc(doc(db, 'registry', 'config'), { creators: ['owner@example.dev'] });
   });
@@ -82,6 +89,8 @@ afterAll(async () => {
 });
 
 const packageDoc = (context: RulesTestContext, name: string) => doc(context.firestore(), 'packages', name);
+const accessDoc = (context: RulesTestContext, name: string) =>
+  doc(context.firestore(), 'packages', name, 'private', 'access');
 const versionDoc = (context: RulesTestContext, name: string) =>
   doc(context.firestore(), 'packages', name, 'versions', '1.0.0');
 const artifact = (context: RulesTestContext, name: string) =>
@@ -96,6 +105,7 @@ describe('reading a restricted package', () => {
   ])('allows %s to read the package, its versions and its artifact', async (_label, who) => {
     await assertSucceeds(getDoc(packageDoc(who(), RESTRICTED)));
     await assertSucceeds(getDoc(versionDoc(who(), RESTRICTED)));
+    await assertSucceeds(getDocs(collection(who().firestore(), 'packages', RESTRICTED, 'versions')));
     const bytes = await assertSucceeds(getBytes(artifact(who(), RESTRICTED)));
     expect(new Uint8Array(bytes)).toEqual(new Uint8Array([1, 2, 3]));
   });
@@ -107,7 +117,13 @@ describe('reading a restricted package', () => {
   ])('denies %s the package, its versions and its artifact', async (_label, who) => {
     await assertFails(getDoc(packageDoc(who(), RESTRICTED)));
     await assertFails(getDoc(versionDoc(who(), RESTRICTED)));
+    await assertFails(getDocs(collection(who().firestore(), 'packages', RESTRICTED, 'versions')));
     await assertFails(getBytes(artifact(who(), RESTRICTED)));
+  });
+
+  it('gives the same answer for a package that does not exist', async () => {
+    await assertFails(getDoc(packageDoc(reader, 'rules-no-such-package')));
+    await assertFails(getDoc(versionDoc(reader, 'rules-no-such-package')));
   });
 });
 
@@ -122,85 +138,101 @@ describe('reading a public package', () => {
   });
 });
 
-describe('listing packages', () => {
-  const packages = (context: RulesTestContext) => collection(context.firestore(), 'packages');
-
-  it('lets a reader find packages shared with their email', async () => {
-    const result = await assertSucceeds(
-      getDocs(query(packages(reader), where('readers', 'array-contains', 'reader@example.dev'))),
-    );
-    expect(result.docs.map((entry) => entry.id)).toContain(RESTRICTED);
+describe('who has access stays between maintainers', () => {
+  it('does not put access lists on the document readers receive', async () => {
+    const data = (await assertSucceeds(getDoc(packageDoc(reader, RESTRICTED)))).data() ?? {};
+    for (const field of ['readers', 'readerDomains', 'maintainers', 'trustedPublishers']) {
+      expect(data).not.toHaveProperty(field);
+    }
   });
 
-  it('lets a colleague find packages shared with their domain', async () => {
-    const result = await assertSucceeds(
-      getDocs(query(packages(colleague), where('readerDomains', 'array-contains', 'acme.dev'))),
-    );
-    expect(result.docs.map((entry) => entry.id)).toContain(RESTRICTED);
-  });
-
-  it('lets a maintainer find their own packages', async () => {
-    await assertSucceeds(getDocs(query(packages(owner), where('maintainers', 'array-contains', 'owner@example.dev'))));
-  });
-
-  it('lets anyone list public packages', async () => {
-    const result = await assertSucceeds(getDocs(query(packages(anonymous), where('visibility', '==', 'public'))));
-    expect(result.docs.map((entry) => entry.id)).toContain(PUBLIC);
-  });
-
-  it('denies listing everything', async () => {
-    await assertFails(getDocs(packages(reader)));
-    await assertFails(getDocs(packages(anonymous)));
-  });
-
-  it("denies querying with someone else's email or domain", async () => {
-    await assertFails(getDocs(query(packages(stranger), where('readers', 'array-contains', 'reader@example.dev'))));
-    await assertFails(getDocs(query(packages(stranger), where('readerDomains', 'array-contains', 'acme.dev'))));
-    await assertFails(getDocs(query(packages(stranger), where('visibility', '==', 'restricted'))));
-  });
-
-  it('lets a reader list the versions of a package they can read, and nobody else', async () => {
-    const versions = (context: RulesTestContext) => collection(context.firestore(), 'packages', RESTRICTED, 'versions');
-    await assertSucceeds(getDocs(versions(reader)));
-    await assertFails(getDocs(versions(stranger)));
-  });
-});
-
-describe('changing a package', () => {
-  it('lets a maintainer edit the access lists', async () => {
-    await assertSucceeds(
-      updateDoc(packageDoc(owner, RESTRICTED), { readers: ['reader@example.dev', 'second@example.dev'] }),
-    );
-    await assertSucceeds(updateDoc(packageDoc(owner, RESTRICTED), { readers: ['reader@example.dev'] }));
+  it('lets a maintainer read the access document', async () => {
+    const data = (await assertSucceeds(getDoc(accessDoc(owner, RESTRICTED)))).data();
+    expect(data?.readers).toEqual(['reader@example.dev']);
   });
 
   it.each([
-    ['the name', { name: 'renamed' }],
-    ['the type', { type: 'other' }],
-    ['the dist-tags', { distTags: { latest: '9.9.9' } }],
-    ['the version count', { versionCount: 99 }],
-  ])('denies a maintainer changing %s', async (_label, change) => {
-    await assertFails(updateDoc(packageDoc(owner, RESTRICTED), change));
+    ['a reader of the package', () => reader, RESTRICTED],
+    ['someone from a listed domain', () => colleague, RESTRICTED],
+    ['a stranger, even for a public package', () => stranger, PUBLIC],
+    ['someone who is not signed in, even for a public package', () => anonymous, PUBLIC],
+  ])('denies the access document to %s', async (_label, who, name) => {
+    await assertFails(getDoc(accessDoc(who(), name)));
   });
 
-  it('denies leaving a package without maintainers or with an unknown visibility', async () => {
-    await assertFails(updateDoc(packageDoc(owner, RESTRICTED), { maintainers: [] }));
-    await assertFails(updateDoc(packageDoc(owner, RESTRICTED), { visibility: 'secret' }));
-    await assertFails(updateDoc(packageDoc(owner, RESTRICTED), { readers: 'reader@example.dev' }));
+  it('denies listing the private documents of a package', async () => {
+    await assertFails(getDocs(collection(owner.firestore(), 'packages', RESTRICTED, 'private')));
+  });
+});
+
+describe('finding packages', () => {
+  const packages = (context: RulesTestContext) => collection(context.firestore(), 'packages');
+  const grants = (context: RulesTestContext) => collection(context.firestore(), 'grants');
+
+  it('lets anyone list public packages, and nothing else', async () => {
+    const result = await assertSucceeds(getDocs(query(packages(anonymous), where('visibility', '==', 'public'))));
+    expect(result.docs.map((entry) => entry.id)).toContain(PUBLIC);
+    await assertFails(getDocs(packages(owner)));
+    await assertFails(getDocs(packages(anonymous)));
+    await assertFails(getDocs(query(packages(owner), where('visibility', '==', 'restricted'))));
   });
 
-  it('denies readers and strangers any change', async () => {
-    await assertFails(updateDoc(packageDoc(reader, RESTRICTED), { readers: ['reader@example.dev', 'x@example.dev'] }));
-    await assertFails(updateDoc(packageDoc(stranger, PUBLIC), { maintainers: ['stranger@elsewhere.dev'] }));
-  });
-
-  it('denies creating and deleting packages and writing versions from a client', async () => {
-    await assertFails(setDoc(packageDoc(owner, 'rules-new'), packageData('rules-new', 'public')));
-    await assertFails(deleteDoc(packageDoc(owner, RESTRICTED)));
-    await assertFails(setDoc(versionDoc(owner, RESTRICTED), { yanked: true }, { merge: true }));
-    await assertFails(
-      setDoc(doc(owner.firestore(), 'packages', RESTRICTED, 'versions', '2.0.0'), { version: '2.0.0' }),
+  it('lets a reader find what is shared with their address', async () => {
+    const result = await assertSucceeds(
+      getDocs(query(grants(reader), where('kind', 'in', ['reader', 'maintainer']), where('principal', '==', 'reader@example.dev'))),
     );
+    // Other tests share these emulators, so there may be more; every hit is the reader's own.
+    expect(result.docs.map((entry) => entry.data().package)).toEqual(expect.arrayContaining([PUBLIC, RESTRICTED]));
+    expect(result.docs.every((entry) => entry.data().principal === 'reader@example.dev')).toBe(true);
+  });
+
+  it('lets a colleague find what is shared with their domain', async () => {
+    const result = await assertSucceeds(
+      getDocs(query(grants(colleague), where('kind', '==', 'domain'), where('principal', '==', 'acme.dev'))),
+    );
+    expect(result.docs.map((entry) => entry.data().package)).toContain(RESTRICTED);
+  });
+
+  it('lets a maintainer find the packages they maintain', async () => {
+    const result = await assertSucceeds(
+      getDocs(query(grants(owner), where('kind', 'in', ['reader', 'maintainer']), where('principal', '==', 'owner@example.dev'))),
+    );
+    expect(result.docs.map((entry) => entry.data().kind)).toContain('maintainer');
+  });
+
+  it("denies looking at someone else's grants", async () => {
+    await assertFails(getDocs(grants(reader)));
+    await assertFails(getDocs(query(grants(stranger), where('kind', '==', 'reader'), where('principal', '==', 'reader@example.dev'))));
+    await assertFails(getDocs(query(grants(stranger), where('kind', '==', 'domain'), where('principal', '==', 'acme.dev'))));
+    await assertFails(getDocs(query(grants(reader), where('package', '==', RESTRICTED))));
+    await assertFails(getDocs(query(grants(anonymous), where('kind', '==', 'domain'), where('principal', '==', 'acme.dev'))));
+    // An address is not a domain grant, and a domain is not an address grant.
+    await assertFails(getDocs(query(grants(reader), where('kind', '==', 'domain'), where('principal', '==', 'reader@example.dev'))));
+    await assertFails(getDoc(doc(reader.firestore(), 'grants', `${RESTRICTED}|maintainer|owner@example.dev`)));
+  });
+});
+
+describe('nothing is writable by a client', () => {
+  it('denies every change to a package, even to its maintainer', async () => {
+    await assertFails(updateDoc(packageDoc(owner, RESTRICTED), { description: 'changed' }));
+    await assertFails(updateDoc(packageDoc(owner, RESTRICTED), { visibility: 'public' }));
+    await assertFails(setDoc(packageDoc(owner, 'rules-new'), { name: 'rules-new', visibility: 'public' }));
+    await assertFails(deleteDoc(packageDoc(owner, RESTRICTED)));
+  });
+
+  it('denies changing access, grants and versions', async () => {
+    await assertFails(updateDoc(accessDoc(owner, RESTRICTED), { readers: ['reader@example.dev', 'x@example.dev'] }));
+    await assertFails(setDoc(accessDoc(stranger, PUBLIC), { visibility: 'public', maintainers: ['stranger@elsewhere.dev'] }));
+    await assertFails(
+      setDoc(doc(stranger.firestore(), 'grants', `${RESTRICTED}|reader|stranger@elsewhere.dev`), {
+        package: RESTRICTED,
+        kind: 'reader',
+        principal: 'stranger@elsewhere.dev',
+      }),
+    );
+    await assertFails(deleteDoc(doc(reader.firestore(), 'grants', `${RESTRICTED}|reader|reader@example.dev`)));
+    await assertFails(setDoc(versionDoc(owner, RESTRICTED), { yanked: true }, { merge: true }));
+    await assertFails(setDoc(doc(owner.firestore(), 'packages', RESTRICTED, 'versions', '2.0.0'), { version: '2.0.0' }));
   });
 
   it('keeps the registry configuration server-side', async () => {
