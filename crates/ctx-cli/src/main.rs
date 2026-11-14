@@ -1,6 +1,6 @@
 //! `ctx` — command-line front end of the ctx package manager.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -14,7 +14,7 @@ use ctx_core::install::{self, Target};
 use ctx_core::lockfile::{LockedPackage, Lockfile};
 use ctx_core::manifest::is_package_name;
 use ctx_core::project::Project;
-use ctx_core::registry::{Registry, TrustedPublisher, VersionInfo};
+use ctx_core::registry::{AccessInfo, Registry, TrustedPublisher, VersionInfo};
 use ctx_core::reqwest::blocking::Client;
 use ctx_core::resolve::{self, Options, Source};
 use ctx_core::{Result, archive, auth, range};
@@ -642,7 +642,10 @@ fn cmd_info(registry_name: Option<&str>, name: &str) -> Result<()> {
     for (tag, version) in &package.dist_tags {
         println!("{tag}: {version}");
     }
-    println!("maintainers: {}", package.maintainers.join(", "));
+    // Only maintainers can see who maintains a package.
+    if let Some(access) = registry.access(name)? {
+        println!("maintainers: {}", access.maintainers.join(", "));
+    }
     println!("versions:");
     for info in registry.versions(name)?.unwrap_or_default() {
         let dependencies = if info.dependencies.is_empty() {
@@ -788,61 +791,69 @@ fn cmd_yank(registry_name: Option<&str>, spec: &str, undo: bool) -> Result<()> {
     Ok(())
 }
 
+/// The access of a package, which only its maintainers may see.
+fn load_access(registry: &Registry, name: &str) -> Result<AccessInfo> {
+    registry.access(name)?.ok_or_else(|| {
+        err(format!(
+            "only maintainers of \"{name}\" can see or change who has access (or the package does not exist)"
+        ))
+    })
+}
+
+/// A list with some entries added or removed, without duplicates.
+fn changed(current: &[String], entries: &[String], adding: bool) -> Vec<String> {
+    let mut set: BTreeSet<String> = current.iter().cloned().collect();
+    for entry in entries {
+        if adding {
+            set.insert(entry.clone());
+        } else {
+            set.remove(entry);
+        }
+    }
+    set.into_iter().collect()
+}
+
 /// Adds people or domains to the access lists of a package, or removes them.
 fn change_access(
     registry: &Registry,
-    info: &ctx_core::registry::PackageInfo,
+    name: &str,
     who: &[String],
     maintainer: bool,
-    granting: bool,
+    adding: bool,
 ) -> Result<()> {
+    let access = load_access(registry, name)?;
     let (emails, domains) = split_who(who);
     if maintainer && !domains.is_empty() {
         return Err(err(
             "a whole domain cannot be a maintainer; name the people",
         ));
     }
-    let change = |current: &[String], entries: &[String]| -> Vec<String> {
-        let mut set: BTreeSet<String> = current.iter().cloned().collect();
-        for entry in entries {
-            if granting {
-                set.insert(entry.clone());
-            } else {
-                set.remove(entry);
-            }
-        }
-        set.into_iter().collect()
-    };
-    let mut update: BTreeMap<&str, Value> = BTreeMap::new();
+    let mut change = serde_json::Map::new();
     if maintainer {
-        let maintainers = change(&info.maintainers, &emails);
+        let maintainers = changed(&access.maintainers, &emails, adding);
         if maintainers.is_empty() {
             return Err(err("a package needs at least one maintainer"));
         }
-        update.insert("maintainers", json!(maintainers));
+        change.insert("maintainers".into(), json!(maintainers));
     } else {
         if !emails.is_empty() {
-            update.insert("readers", json!(change(&info.readers, &emails)));
+            change.insert(
+                "readers".into(),
+                json!(changed(&access.readers, &emails, adding)),
+            );
         }
         if !domains.is_empty() {
-            update.insert(
-                "readerDomains",
-                json!(change(&info.reader_domains, &domains)),
+            change.insert(
+                "readerDomains".into(),
+                json!(changed(&access.reader_domains, &domains, adding)),
             );
         }
     }
-    registry.set_access(&info.name, &update)
+    registry.set_access(name, &Value::Object(change))
 }
 
 fn cmd_access(registry_name: Option<&str>, command: AccessCommand) -> Result<()> {
     let registry = open_registry(registry_name)?;
-    let load = |name: &str| {
-        registry.package(name)?.ok_or_else(|| {
-            err(format!(
-                "package \"{name}\" was not found, or you do not have access to it"
-            ))
-        })
-    };
     let list = |items: &[String]| {
         if items.is_empty() {
             "-".to_string()
@@ -852,12 +863,12 @@ fn cmd_access(registry_name: Option<&str>, command: AccessCommand) -> Result<()>
     };
     match command {
         AccessCommand::List { package } => {
-            let info = load(&package)?;
-            println!("visibility:   {}", info.visibility);
-            println!("maintainers:  {}", list(&info.maintainers));
-            println!("readers:      {}", list(&info.readers));
-            println!("domains:      {}", list(&info.reader_domains));
-            for publisher in &info.trusted_publishers {
+            let access = load_access(&registry, &package)?;
+            println!("visibility:   {}", access.visibility);
+            println!("maintainers:  {}", list(&access.maintainers));
+            println!("readers:      {}", list(&access.readers));
+            println!("domains:      {}", list(&access.reader_domains));
+            for publisher in &access.trusted_publishers {
                 let limits: Vec<String> = [
                     publisher
                         .workflow
@@ -886,6 +897,22 @@ fn cmd_access(registry_name: Option<&str>, command: AccessCommand) -> Result<()>
                 );
             }
         }
+        AccessCommand::Grant {
+            package,
+            who,
+            maintainer,
+        } => {
+            change_access(&registry, &package, &who, maintainer, true)?;
+            println!("Updated access to {package}");
+        }
+        AccessCommand::Revoke {
+            package,
+            who,
+            maintainer,
+        } => {
+            change_access(&registry, &package, &who, maintainer, false)?;
+            println!("Updated access to {package}");
+        }
         AccessCommand::Trust {
             package,
             repository,
@@ -893,7 +920,7 @@ fn cmd_access(registry_name: Option<&str>, command: AccessCommand) -> Result<()>
             git_ref,
             environment,
         } => {
-            let info = load(&package)?;
+            let access = load_access(&registry, &package)?;
             let repository = repository.trim().to_lowercase();
             if repository.split('/').count() != 2 || repository.split('/').any(str::is_empty) {
                 return Err(err("expected a GitHub repository as owner/repo"));
@@ -907,7 +934,7 @@ fn cmd_access(registry_name: Option<&str>, command: AccessCommand) -> Result<()>
                     format!("{repository}/.github/workflows/{workflow}")
                 }
             });
-            let mut publishers: Vec<TrustedPublisher> = info
+            let mut publishers: Vec<TrustedPublisher> = access
                 .trusted_publishers
                 .iter()
                 .filter(|entry| entry.repository != repository)
@@ -920,57 +947,32 @@ fn cmd_access(registry_name: Option<&str>, command: AccessCommand) -> Result<()>
                 git_ref,
                 environment,
             });
-            registry.set_access(
-                &package,
-                &BTreeMap::from([("trustedPublishers", json!(publishers))]),
-            )?;
+            registry.set_access(&package, &json!({ "trustedPublishers": publishers }))?;
             println!("{package} now trusts {repository}");
         }
         AccessCommand::Untrust {
             package,
             repository,
         } => {
-            let info = load(&package)?;
+            let access = load_access(&registry, &package)?;
             let repository = repository.trim().to_lowercase();
-            let publishers: Vec<&TrustedPublisher> = info
+            let publishers: Vec<&TrustedPublisher> = access
                 .trusted_publishers
                 .iter()
                 .filter(|entry| entry.repository != repository)
                 .collect();
-            if publishers.len() == info.trusted_publishers.len() {
+            if publishers.len() == access.trusted_publishers.len() {
                 return Err(err(format!("{package} does not trust {repository}")));
             }
-            registry.set_access(
-                &package,
-                &BTreeMap::from([("trustedPublishers", json!(publishers))]),
-            )?;
+            registry.set_access(&package, &json!({ "trustedPublishers": publishers }))?;
             println!("{package} no longer trusts {repository}");
         }
         AccessCommand::Visibility {
             package,
             visibility,
         } => {
-            registry.set_access(
-                &package,
-                &BTreeMap::from([("visibility", json!(visibility))]),
-            )?;
+            registry.set_access(&package, &json!({ "visibility": visibility }))?;
             println!("{package} is now {visibility}");
-        }
-        AccessCommand::Grant {
-            package,
-            who,
-            maintainer,
-        } => {
-            change_access(&registry, &load(&package)?, &who, maintainer, true)?;
-            println!("Updated access to {package}");
-        }
-        AccessCommand::Revoke {
-            package,
-            who,
-            maintainer,
-        } => {
-            change_access(&registry, &load(&package)?, &who, maintainer, false)?;
-            println!("Updated access to {package}");
         }
     }
     Ok(())
