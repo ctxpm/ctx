@@ -233,8 +233,60 @@ fn token_for(http: &Client, name: &str, descriptor: &Descriptor) -> Result<Optio
     Ok(Some(token))
 }
 
+/// Registry address compiled into release builds; used when none was added yet.
+const DEFAULT_REGISTRY: Option<&str> = option_env!("CTX_DEFAULT_REGISTRY");
+
+fn fetch_descriptor(source: &str) -> Result<Descriptor> {
+    let is_url = source.starts_with("https://") || source.starts_with("http://");
+    let raw = if is_url {
+        let url = if source.ends_with(".json") {
+            source.to_string()
+        } else {
+            format!("{}{WELL_KNOWN_PATH}", source.trim_end_matches('/'))
+        };
+        let response = http()?.get(&url).send()?;
+        if !response.status().is_success() {
+            return Err(err(format!(
+                "{url} returned {}; is this a ctx registry?",
+                response.status()
+            )));
+        }
+        response.text()?
+    } else {
+        fs::read_to_string(source).context(format!("cannot read {source}"))?
+    };
+    Descriptor::parse(&raw)
+}
+
+/// Loads the configuration; on first use of a release build, adds its default registry.
+fn load_config() -> Result<Config> {
+    let mut config = Config::load()?;
+    if config.registries.is_empty() {
+        if let Some(url) = DEFAULT_REGISTRY.filter(|url| !url.is_empty()) {
+            let descriptor = fetch_descriptor(url)?;
+            let name = descriptor
+                .name
+                .as_deref()
+                .map(slug)
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "default".into());
+            eprintln!("Using the registry at {url} (change it with `ctx registry add`).");
+            config.registries.insert(
+                name.clone(),
+                RegistryEntry {
+                    source: url.to_string(),
+                    descriptor,
+                },
+            );
+            config.default_registry = Some(name);
+            config.save()?;
+        }
+    }
+    Ok(config)
+}
+
 fn open_registry(selected: Option<&str>) -> Result<Registry> {
-    let config = Config::load()?;
+    let config = load_config()?;
     let (name, entry) = config.registry(selected)?;
     let http = http()?;
     let token = token_for(&http, &name, &entry.descriptor)?;
@@ -816,25 +868,7 @@ fn cmd_registry(command: RegistryCommand) -> Result<()> {
     let mut config = Config::load()?;
     match command {
         RegistryCommand::Add { source, name } => {
-            let is_url = source.starts_with("https://") || source.starts_with("http://");
-            let raw = if is_url {
-                let url = if source.ends_with(".json") {
-                    source.clone()
-                } else {
-                    format!("{}{WELL_KNOWN_PATH}", source.trim_end_matches('/'))
-                };
-                let response = http()?.get(&url).send()?;
-                if !response.status().is_success() {
-                    return Err(err(format!(
-                        "{url} returned {}; is this a ctx registry?",
-                        response.status()
-                    )));
-                }
-                response.text()?
-            } else {
-                fs::read_to_string(&source).context(format!("cannot read {source}"))?
-            };
-            let descriptor = Descriptor::parse(&raw)?;
+            let descriptor = fetch_descriptor(&source)?;
             let name = name
                 .or_else(|| descriptor.name.as_deref().map(slug))
                 .filter(|name| !name.is_empty())
@@ -895,7 +929,7 @@ fn cmd_registry(command: RegistryCommand) -> Result<()> {
 }
 
 fn cmd_login(registry_name: Option<&str>, dev_email: Option<String>) -> Result<()> {
-    let config = Config::load()?;
+    let config = load_config()?;
     let (name, entry) = config.registry(registry_name)?;
     let http = http()?;
     let session = match dev_email {
@@ -911,7 +945,7 @@ fn cmd_login(registry_name: Option<&str>, dev_email: Option<String>) -> Result<(
 }
 
 fn cmd_logout(registry_name: Option<&str>) -> Result<()> {
-    let config = Config::load()?;
+    let config = load_config()?;
     let (name, _) = config.registry(registry_name)?;
     let mut credentials = Credentials::load()?;
     if credentials.sessions.remove(&name).is_some() {
@@ -924,7 +958,7 @@ fn cmd_logout(registry_name: Option<&str>) -> Result<()> {
 }
 
 fn cmd_whoami(registry_name: Option<&str>) -> Result<()> {
-    let config = Config::load()?;
+    let config = load_config()?;
     let (name, entry) = config.registry(registry_name)?;
     match token_for(&http()?, &name, &entry.descriptor)? {
         Some(token) => match auth::email_of(&token) {

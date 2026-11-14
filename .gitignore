@@ -3,10 +3,8 @@
 
 # Node
 node_modules/
-lib/
+registry/functions/lib/
 dist/
-.svelte-kit/
-build/
 
 # Firebase
 .firebase/
@@ -19,6 +17,10 @@ firebase-export-*/
 .env.local
 .env.*.local
 *.local.*
+
+# Descriptors of real registries are written per deployment, not committed
+registry/descriptor.*.json
+registry/public/
 
 # ctx itself
 .ctx/

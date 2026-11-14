@@ -94,8 +94,29 @@ the API tests against them. Nothing touches a real Firebase project.
 
 ## Deploying to your own project
 
-```sh
-firebase deploy --project <your project id> --only firestore,storage,functions
-```
+1. Create a Firebase project on the Blaze plan with Firestore, Cloud Storage and
+   Authentication (Google sign-in enabled), and register a web app in it.
+2. In the Google Cloud console of that project, create an OAuth client of type
+   "Desktop app". The CLI signs in with it.
+3. Write `registry/descriptor.<project id>.json` (shape: `spec/registry.schema.json`) with
+   the web app's `apiKey`, the bucket, the address of the site plus `/v1` as `api`, and
+   the desktop client under `oauth`. The file is public once deployed, but it is not
+   committed: it belongs to your deployment.
+4. Deploy:
 
-Then create `registry/config` in the Firestore console with yourself as a creator.
+   ```sh
+   scripts/deploy-registry.sh <project id>
+   ```
+
+   This publishes the rules, the `api` function and the web app, and serves the
+   descriptor at `/.well-known/ctx-registry.json`.
+5. Create the document `registry/config` in Firestore with yourself as a creator.
+6. Let Cloud Storage rules read Firestore, once per project:
+
+   ```sh
+   gcloud projects add-iam-policy-binding <project id> \
+     --member "serviceAccount:service-<project number>@gcp-sa-firebasestorage.iam.gserviceaccount.com" \
+     --role roles/firebaserules.firestoreServiceAgent
+   ```
+
+People then run `ctx registry add https://<your site>`.

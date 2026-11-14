@@ -3,8 +3,8 @@
 A package manager for **context artifacts**: versioned bundles of Markdown and YAML that
 give people and AI agents the same source of truth about a project, a team or a discipline.
 
-> **Status: early development.** The registry backend and the CLI work end to end against
-> the Firebase emulators. There is no hosted registry, no release and no web UI yet.
+> **Status: early development.** Registry backend, CLI and web app work end to end against
+> the Firebase emulators. Expect breaking changes.
 
 ## Why
 
@@ -27,7 +27,7 @@ manager it has nothing to do with. `ctx` treats a context bundle as a first-clas
 | `spec/` | JSON Schemas for the package manifest and the registry descriptor |
 | `registry/` | Firebase backend: security rules, publish API, emulator tests |
 | `crates/` | Rust CLI: `ctx-core` (library) and `ctx-cli` (the `ctx` binary) |
-| `web/` | Web UI for browsing packages (planned) |
+| `web/` | Web app for browsing packages and managing access (Svelte) |
 | `examples/` | Sample packages, also used as test fixtures |
 | `docs/` | Design notes |
 
@@ -47,6 +47,16 @@ A package is a directory with a `manifest.json` at its root:
 ```
 
 Everything else in the directory is content. See [`docs/package-format.md`](docs/package-format.md).
+
+## Installing the CLI
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ctxpm/ctx/main/install.sh | sh
+```
+
+This downloads the binary for your platform from the GitHub releases, checks its SHA-256
+and puts it in `~/.local/bin`. It needs no Node, npm or other package manager. Windows
+binaries are on the [releases page](https://github.com/ctxpm/ctx/releases).
 
 ## Using the CLI
 
@@ -90,6 +100,12 @@ npm test                                 # registry: typecheck, unit, rules and 
 
 ./scripts/e2e.sh                         # the ctx binary against the emulators
 ```
+
+The web app reads its whole configuration from `/.well-known/ctx-registry.json` at
+runtime. `npm run dev` in `web/` serves the descriptor of the local emulators, so start
+those first (`firebase emulators:start --project demo-ctx` in `registry/`).
+
+To run your own registry, see [`registry/README.md`](registry/README.md).
 
 Every test that needs a registry runs against the emulators under the throwaway project
 id `demo-ctx`; nothing touches a real Firebase project.

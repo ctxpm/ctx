@@ -1,0 +1,195 @@
+/* Design tokens. The six "stratum" colours are the identity of the site: every package
+   type gets one, and a package's dependencies are drawn as layers in those colours. */
+:root {
+  --paper: #f1f4ef;
+  --surface: #ffffff;
+  --ink: #14261f;
+  --ink-soft: #50625a;
+  --line: #d3dcd4;
+  --action: #1f4d3d;
+  --action-ink: #ffffff;
+  --focus: #c7791a;
+  --danger: #a3341f;
+
+  --stratum-1: #3d5a80;
+  --stratum-2: #5b7f3a;
+  --stratum-3: #c7791a;
+  --stratum-4: #7a3e65;
+  --stratum-5: #b4472f;
+  --stratum-6: #2c7a7b;
+
+  --display: 'Bricolage Grotesque Variable', 'IBM Plex Sans', system-ui, sans-serif;
+  --body: 'IBM Plex Sans', system-ui, sans-serif;
+  --mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  --step--1: 0.84rem;
+  --step-0: 1rem;
+  --step-1: 1.2rem;
+  --step-2: 1.6rem;
+  --step-3: clamp(1.9rem, 1.2rem + 2.6vw, 3rem);
+
+  --measure: 68ch;
+  --gutter: clamp(1rem, 0.5rem + 2.5vw, 2.5rem);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #0e1814;
+    --surface: #15221d;
+    --ink: #e4ede8;
+    --ink-soft: #9bafa5;
+    --line: #2a3c34;
+    --action: #8fd6b6;
+    --action-ink: #0e1814;
+    --focus: #e3a04a;
+    --danger: #f08a73;
+
+    --stratum-1: #7d9cc7;
+    --stratum-2: #9dc078;
+    --stratum-3: #e3a04a;
+    --stratum-4: #c486ae;
+    --stratum-5: #e58a72;
+    --stratum-6: #6cc0c1;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--body);
+  font-size: var(--step-0);
+  line-height: 1.55;
+}
+
+h1,
+h2,
+h3 {
+  font-family: var(--display);
+  font-weight: 650;
+  line-height: 1.15;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: inherit;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.2em;
+}
+
+code,
+kbd,
+pre {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+/* Buttons: one solid action per view, everything else is quiet. */
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  cursor: pointer;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.button:hover {
+  border-color: var(--ink-soft);
+}
+
+.button[disabled] {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.button.primary {
+  background: var(--action);
+  border-color: var(--action);
+  color: var(--action-ink);
+}
+
+.button.plain {
+  border-color: transparent;
+  background: none;
+  padding-inline: 0.4rem;
+  color: var(--ink-soft);
+}
+
+.button.plain:hover {
+  color: var(--ink);
+}
+
+.field {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  min-width: 0;
+}
+
+.muted {
+  color: var(--ink-soft);
+}
+
+.small {
+  font-size: var(--step--1);
+}
+
+.notice {
+  padding: 0.75rem 1rem;
+  border-left: 4px solid var(--focus);
+  background: var(--surface);
+}
+
+.notice.problem {
+  border-left-color: var(--danger);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
+}
