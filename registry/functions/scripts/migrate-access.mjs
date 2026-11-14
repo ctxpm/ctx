@@ -8,8 +8,8 @@
 //
 // Credentials: application default credentials, or an OAuth access token in ACCESS_TOKEN
 // (for example ACCESS_TOKEN=$(gcloud auth print-access-token)).
-import { applicationDefault, initializeApp } from 'firebase-admin/app';
-import { FieldValue, getFirestore } from 'firebase-admin/firestore';
+import { FieldValue, Firestore } from '@google-cloud/firestore';
+import { OAuth2Client } from 'google-auth-library';
 
 const apply = process.argv.includes('--apply');
 const projectId = process.env.GCLOUD_PROJECT;
@@ -19,13 +19,13 @@ if (!projectId) {
 }
 
 const token = process.env.ACCESS_TOKEN;
-initializeApp({
-  projectId,
-  credential: token
-    ? { getAccessToken: async () => ({ access_token: token, expires_in: 3000 }) }
-    : applicationDefault(),
-});
-const db = getFirestore();
+const options = { projectId };
+if (token) {
+  const client = new OAuth2Client();
+  client.setCredentials({ access_token: token });
+  options.authClient = client;
+}
+const db = new Firestore(options);
 
 const ACCESS_FIELDS = ['readers', 'readerDomains', 'maintainers', 'trustedPublishers', 'createdBy'];
 const list = (value) => (Array.isArray(value) ? value.filter((item) => typeof item === 'string').map((item) => item.toLowerCase()) : []);
