@@ -1,0 +1,67 @@
+name: Publish a ctx package
+description: >
+  Publishes a package directory to a ctx registry from GitHub Actions, without a stored
+  secret. The package must trust this repository (ctx access trust), and the job needs
+  the permission "id-token: write".
+
+inputs:
+  registry:
+    description: Address of the registry, for example https://registry.example.dev
+    required: true
+  path:
+    description: Directory that holds the package's manifest.json
+    required: false
+    default: .
+  tag:
+    description: Publish under this dist-tag instead of moving "latest"
+    required: false
+    default: ''
+  ctx-version:
+    description: Version of the ctx CLI to use, for example 0.1.1 (default is the latest release)
+    required: false
+    default: latest
+
+runs:
+  using: composite
+  steps:
+    - name: Install ctx
+      shell: bash
+      env:
+        CTX_VERSION: ${{ inputs.ctx-version }}
+        CTX_INSTALL_DIR: ${{ runner.temp }}/ctx-bin
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/ctxpm/ctx/main/install.sh | sh
+        echo "$CTX_INSTALL_DIR" >> "$GITHUB_PATH"
+
+    - name: Publish
+      shell: bash
+      env:
+        REGISTRY: ${{ inputs.registry }}
+        PACKAGE_PATH: ${{ inputs.path }}
+        DIST_TAG: ${{ inputs.tag }}
+        CTX_CONFIG_DIR: ${{ runner.temp }}/ctx-config
+      run: |
+        set -euo pipefail
+        if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+          echo "::error::This job cannot request an identity token. Add 'permissions: id-token: write' to the job."
+          exit 1
+        fi
+
+        registry="${REGISTRY%/}"
+        # The registry says which audience a publish token must be issued for.
+        audience="$(curl -fsSL "$registry/.well-known/ctx-registry.json" | jq -r '.oidcAudience // empty')"
+        if [ -z "$audience" ]; then
+          echo "::error::$registry does not accept publishing from CI (its descriptor has no oidcAudience)."
+          exit 1
+        fi
+
+        token="$(curl -fsSL -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$(jq -rn --arg value "$audience" '$value|@uri')" | jq -r '.value')"
+        echo "::add-mask::$token"
+
+        ctx registry add "$registry" --name ci >/dev/null
+        if [ -n "$DIST_TAG" ]; then
+          CTX_TOKEN="$token" ctx publish "$PACKAGE_PATH" --tag "$DIST_TAG"
+        else
+          CTX_TOKEN="$token" ctx publish "$PACKAGE_PATH"
+        fi

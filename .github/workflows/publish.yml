@@ -1,0 +1,54 @@
+name: Publish a ctx package
+
+# Reusable workflow: call it from the repository that holds a package.
+#
+#   jobs:
+#     publish:
+#       permissions:
+#         id-token: write
+#         contents: read
+#       uses: ctxpm/ctx/.github/workflows/publish.yml@main
+#       with:
+#         registry: https://registry.example.dev
+#
+# The identity the registry sees names THIS workflow file as the workflow, so trust it
+# with: ctx access trust <package> <owner/repo> --workflow ctxpm/ctx/.github/workflows/publish.yml
+on:
+  workflow_call:
+    inputs:
+      registry:
+        description: Address of the registry
+        required: true
+        type: string
+      path:
+        description: Directory that holds the package's manifest.json
+        required: false
+        type: string
+        default: .
+      tag:
+        description: Publish under this dist-tag instead of moving "latest"
+        required: false
+        type: string
+        default: ''
+      ctx-version:
+        description: Version of the ctx CLI to use
+        required: false
+        type: string
+        default: latest
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ctxpm/ctx/actions/publish@main
+        with:
+          registry: ${{ inputs.registry }}
+          path: ${{ inputs.path }}
+          tag: ${{ inputs.tag }}
+          ctx-version: ${{ inputs.ctx-version }}

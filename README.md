@@ -28,6 +28,7 @@ manager it has nothing to do with. `ctx` treats a context bundle as a first-clas
 | `registry/` | Firebase backend: security rules, publish API, emulator tests |
 | `crates/` | Rust CLI: `ctx-core` (library) and `ctx-cli` (the `ctx` binary) |
 | `web/` | Web app for browsing packages and managing access (Svelte) |
+| `actions/publish/` | GitHub Action that publishes a package from CI |
 | `examples/` | Sample packages, also used as test fixtures |
 | `docs/` | Design notes |
 
@@ -87,7 +88,8 @@ dir = "layers"
 preserve = [".local", "*.local.yml"]
 ```
 
-In CI, set `CTX_TOKEN` instead of signing in.
+To publish from GitHub Actions without a stored secret, see
+[`docs/publishing-from-ci.md`](docs/publishing-from-ci.md).
 
 ## Development
 
