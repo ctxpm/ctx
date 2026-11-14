@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ctxpm/ctx/blob/main/spec/manifest.schema.json",
+  "title": "ctx package manifest",
+  "description": "manifest.json at the root of a ctx package. Unknown top-level fields are allowed and preserved.",
+  "type": "object",
+  "required": ["schemaVersion", "name", "version", "type"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "name": { "$ref": "#/$defs/packageName" },
+    "version": {
+      "description": "Exact semantic version (https://semver.org), without a leading 'v'.",
+      "type": "string",
+      "maxLength": 64
+    },
+    "type": {
+      "description": "Kind of context this package holds, for example 'project' or 'discipline'. Fixed for the lifetime of a package name.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9-]{0,31}$"
+    },
+    "description": { "type": "string", "maxLength": 500 },
+    "dependencies": {
+      "description": "Package name to semver range.",
+      "type": "object",
+      "maxProperties": 200,
+      "propertyNames": { "$ref": "#/$defs/packageName" },
+      "additionalProperties": { "type": "string", "maxLength": 128 }
+    },
+    "provides": {
+      "description": "Free-form description of what the package contributes; interpreted by consumers, not by ctx.",
+      "type": "object"
+    },
+    "engines": {
+      "description": "Tool name to semver range the package requires.",
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "provenance": {
+      "description": "Where and how the artifact was built.",
+      "type": "object",
+      "properties": {
+        "repository": { "type": "string" },
+        "commit": { "type": "string" },
+        "ref": { "type": "string" },
+        "builtAt": { "type": "string" },
+        "builder": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "packageName": {
+      "description": "Lowercase kebab-case, 1 to 64 characters.",
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$"
+    }
+  }
+}

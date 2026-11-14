@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/ctxpm/ctx/blob/main/spec/registry.schema.json",
+  "title": "ctx registry descriptor",
+  "description": "Served by a registry at /.well-known/ctx-registry.json. Everything in it is public; it tells a client how to reach the registry and grants nothing by itself.",
+  "type": "object",
+  "required": ["schemaVersion", "firebase", "api"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "name": { "description": "Human-readable registry name.", "type": "string" },
+    "firebase": {
+      "type": "object",
+      "required": ["projectId", "apiKey", "storageBucket"],
+      "properties": {
+        "projectId": { "type": "string" },
+        "apiKey": { "type": "string" },
+        "storageBucket": { "type": "string" },
+        "authDomain": { "type": "string" }
+      }
+    },
+    "oauth": {
+      "description": "Google OAuth client of type 'Desktop app', used by the CLI for the loopback sign-in flow. The secret of a desktop client is not confidential.",
+      "type": "object",
+      "required": ["clientId"],
+      "properties": {
+        "clientId": { "type": "string" },
+        "clientSecret": { "type": "string" }
+      }
+    },
+    "api": {
+      "description": "Base URL of the publish API, without a trailing slash and including the version segment, for example https://registry.example.dev/v1.",
+      "type": "string"
+    },
+    "oidcAudience": {
+      "description": "Audience a CI job must request for its OIDC token when publishing.",
+      "type": "string"
+    }
+  }
+}

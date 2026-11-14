@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "name": "frontend-standards",
+  "version": "1.0.0",
+  "type": "discipline",
+  "description": "Example package: shared front-end engineering standards",
+  "dependencies": {}
+}

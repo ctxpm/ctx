@@ -1,0 +1,29 @@
+# Rust
+/target/
+
+# Node
+node_modules/
+lib/
+dist/
+.svelte-kit/
+build/
+
+# Firebase
+.firebase/
+.firebaserc
+*-debug.log
+firebase-export-*/
+
+# Local environment and secrets
+.env
+.env.local
+.env.*.local
+*.local.*
+
+# ctx itself
+.ctx/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

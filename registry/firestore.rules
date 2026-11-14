@@ -1,0 +1,66 @@
+rules_version = '2';
+
+// Read access to the registry index. Versions and dist-tags are written only by the
+// publish API (Admin SDK, which bypasses these rules). Clients may read what they are
+// entitled to, and maintainers may edit the access lists of their own package.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null
+        && request.auth.token.email != null
+        && request.auth.token.email_verified == true;
+    }
+
+    function email() {
+      return request.auth.token.email.lower();
+    }
+
+    function domain() {
+      return email().split('@')[1];
+    }
+
+    function canRead(pkg) {
+      return pkg.visibility == 'public'
+        || (signedIn() && (
+          email() in pkg.readers
+          || email() in pkg.maintainers
+          || domain() in pkg.readerDomains
+        ));
+    }
+
+    function isMaintainer(pkg) {
+      return signedIn() && email() in pkg.maintainers;
+    }
+
+    function validAccess(pkg) {
+      return pkg.visibility in ['public', 'restricted']
+        && pkg.readers is list && pkg.readers.size() <= 500
+        && pkg.readerDomains is list && pkg.readerDomains.size() <= 100
+        && pkg.maintainers is list && pkg.maintainers.size() >= 1 && pkg.maintainers.size() <= 100
+        && pkg.trustedPublishers is list && pkg.trustedPublishers.size() <= 20
+        && pkg.description is string && pkg.description.size() <= 500;
+    }
+
+    match /packages/{name} {
+      allow read: if canRead(resource.data);
+
+      allow update: if isMaintainer(resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+          ['description', 'visibility', 'readers', 'readerDomains', 'maintainers', 'trustedPublishers'])
+        && validAccess(request.resource.data);
+
+      allow create, delete: if false;
+
+      match /versions/{version} {
+        allow read: if canRead(get(/databases/$(database)/documents/packages/$(name)).data);
+        allow write: if false;
+      }
+    }
+
+    // Registry configuration (who may create packages) is server-side only.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

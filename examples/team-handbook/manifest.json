@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "name": "team-handbook",
+  "version": "1.0.0",
+  "type": "team",
+  "description": "Example package: how a team works",
+  "dependencies": {
+    "frontend-standards": "^1.0.0"
+  }
+}

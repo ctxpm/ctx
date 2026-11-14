@@ -1,0 +1,41 @@
+rules_version = '2';
+
+// Artifacts are written only by the publish API. A client may download an artifact when
+// the Firestore package document says it may read the package. Keep canRead() identical
+// to the one in firestore.rules.
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function signedIn() {
+      return request.auth != null
+        && request.auth.token.email != null
+        && request.auth.token.email_verified == true;
+    }
+
+    function email() {
+      return request.auth.token.email.lower();
+    }
+
+    function domain() {
+      return email().split('@')[1];
+    }
+
+    function canRead(pkg) {
+      return pkg.visibility == 'public'
+        || (signedIn() && (
+          email() in pkg.readers
+          || email() in pkg.maintainers
+          || domain() in pkg.readerDomains
+        ));
+    }
+
+    match /packages/{name}/{version}/{artifact} {
+      allow get: if canRead(firestore.get(/databases/(default)/documents/packages/$(name)).data);
+      allow list, write: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
