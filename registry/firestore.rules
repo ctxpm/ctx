@@ -1,8 +1,12 @@
 rules_version = '2';
 
-// Read access to the registry index. Versions and dist-tags are written only by the
-// publish API (Admin SDK, which bypasses these rules). Clients may read what they are
-// entitled to, and maintainers may edit the access lists of their own package.
+// Read access to the registry index. Nothing is writable by clients: every change goes
+// through the API (Admin SDK, which bypasses these rules).
+//
+//   packages/{name}                  what readers see
+//   packages/{name}/private/access   who may read and maintain; maintainers only
+//   grants/{id}                      one entry per reader, domain or maintainer; readable
+//                                    only by whom it names
 service cloud.firestore {
   match /databases/{database}/documents {
 
@@ -20,42 +24,48 @@ service cloud.firestore {
       return email().split('@')[1];
     }
 
-    function canRead(pkg) {
-      return pkg.visibility == 'public'
-        || (signedIn() && (
-          email() in pkg.readers
-          || email() in pkg.maintainers
-          || domain() in pkg.readerDomains
-        ));
+    // The access document of a package. Rules may look it up; clients that are not
+    // maintainers never receive it.
+    function accessOf(name) {
+      return get(/databases/$(database)/documents/packages/$(name)/private/access).data;
     }
 
-    function isMaintainer(pkg) {
-      return signedIn() && email() in pkg.maintainers;
+    function listedIn(access) {
+      return signedIn() && (
+        email() in access.readers
+        || email() in access.maintainers
+        || domain() in access.readerDomains
+      );
     }
 
-    function validAccess(pkg) {
-      return pkg.visibility in ['public', 'restricted']
-        && pkg.readers is list && pkg.readers.size() <= 500
-        && pkg.readerDomains is list && pkg.readerDomains.size() <= 100
-        && pkg.maintainers is list && pkg.maintainers.size() >= 1 && pkg.maintainers.size() <= 100
-        && pkg.trustedPublishers is list && pkg.trustedPublishers.size() <= 20
-        && pkg.description is string && pkg.description.size() <= 500;
+    function canRead(name) {
+      return accessOf(name).visibility == 'public' || listedIn(accessOf(name));
     }
 
     match /packages/{name} {
-      allow read: if canRead(resource.data);
-
-      allow update: if isMaintainer(resource.data)
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(
-          ['description', 'visibility', 'readers', 'readerDomains', 'maintainers', 'trustedPublishers'])
-        && validAccess(request.resource.data);
-
-      allow create, delete: if false;
+      allow get: if resource.data.visibility == 'public' || listedIn(accessOf(name));
+      // Listing is limited to public packages; what is shared with someone is found
+      // through their grants.
+      allow list: if resource.data.visibility == 'public';
+      allow write: if false;
 
       match /versions/{version} {
-        allow read: if canRead(get(/databases/$(database)/documents/packages/$(name)).data);
+        allow read: if canRead(name);
         allow write: if false;
       }
+
+      match /private/access {
+        allow get: if signedIn() && email() in resource.data.maintainers;
+        allow list, write: if false;
+      }
+    }
+
+    match /grants/{grant} {
+      allow read: if signedIn() && (
+        (resource.data.kind in ['reader', 'maintainer'] && resource.data.principal == email())
+        || (resource.data.kind == 'domain' && resource.data.principal == domain())
+      );
+      allow write: if false;
     }
 
     // Registry configuration (who may create packages) is server-side only.

@@ -3,7 +3,7 @@ import { createServer, type Server } from 'node:http';
 import { exportJWK, generateKeyPair, SignJWT, type JWK } from 'jose';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { packageTgz, tgz } from '../tarballs.js';
-import { adminBucket, adminDb, API, BUCKET, seedPackage, signIn, STORAGE, uniqueName } from './helpers.js';
+import { accessOf, adminBucket, adminDb, API, BUCKET, grantsOf, seedPackage, signIn, STORAGE, uniqueName } from './helpers.js';
 
 // Must match registry/functions/.env.demo-ctx.
 const ISSUER = 'http://127.0.0.1:9911';
@@ -145,12 +145,21 @@ describe('publishing as a user', () => {
       name,
       type: 'project',
       visibility: 'restricted',
-      readers: [],
-      maintainers: ['owner@example.dev'],
       distTags: { latest: '1.0.0' },
       latestVersion: '1.0.0',
       versionCount: 1,
     });
+    // Who has access is not on the document readers can see.
+    expect(pkg).not.toHaveProperty('maintainers');
+    expect(pkg).not.toHaveProperty('readers');
+    expect(await accessOf(name)).toMatchObject({
+      visibility: 'restricted',
+      readers: [],
+      readerDomains: [],
+      maintainers: ['owner@example.dev'],
+      trustedPublishers: [],
+    });
+    expect(await grantsOf(name)).toEqual([`${name}|maintainer|owner@example.dev`]);
 
     const version = (await adminDb.doc(`packages/${name}/versions/1.0.0`).get()).data();
     expect(version).toMatchObject({
@@ -362,14 +371,20 @@ describe('creating a package up front', () => {
       }),
     });
     expect(result).toEqual({ status: 201, body: { name } });
-    expect((await adminDb.doc(`packages/${name}`).get()).data()).toMatchObject({
+    expect((await adminDb.doc(`packages/${name}`).get()).data()).toMatchObject({ visibility: 'public', versionCount: 0 });
+    expect(await accessOf(name)).toMatchObject({
       visibility: 'public',
       readers: ['reader@example.dev'],
       readerDomains: ['acme.dev'],
       maintainers: ['owner@example.dev', 'second@example.dev'],
       trustedPublishers: [{ provider: 'github', repository: 'acme/handbook' }],
-      versionCount: 0,
     });
+    expect(await grantsOf(name)).toEqual([
+      `${name}|domain|acme.dev`,
+      `${name}|maintainer|owner@example.dev`,
+      `${name}|maintainer|second@example.dev`,
+      `${name}|reader|reader@example.dev`,
+    ]);
 
     const again = await call('/packages', { token: owner, body: JSON.stringify({ name, type: 'project' }) });
     expect(again.status).toBe(409);
@@ -381,6 +396,91 @@ describe('creating a package up front', () => {
     expect((await call('/packages', { token: owner, body: JSON.stringify({ name: 'Bad Name', type: 'project' }) })).status).toBe(400);
     expect((await call('/packages', { token: owner, body: JSON.stringify({ name: uniqueName('x'), type: 'project', readers: ['nope'] }) })).status).toBe(400);
     expect((await call('/packages', { token: owner, body: 'not json' })).status).toBe(400);
+  });
+});
+
+describe('changing who has access', () => {
+  const patch = (name: string, token: string | undefined, change: unknown) =>
+    call(`/packages/${name}/access`, { method: 'PATCH', token, body: JSON.stringify(change) });
+
+  it('replaces the lists, normalises entries and keeps the grants in line', async () => {
+    const name = uniqueName('access');
+    await publish(owner, await packageTgz(name, '1.0.0'));
+
+    const first = await patch(name, owner, {
+      readers: [' Reader@Example.dev', 'reader@example.dev', 'other@example.dev'],
+      readerDomains: ['Acme.DEV'],
+      trustedPublishers: [{ provider: 'github', repository: 'Acme/Handbook', ref: 'refs/heads/main' }],
+    });
+    expect(first.status).toBe(200);
+    expect(await accessOf(name)).toMatchObject({
+      visibility: 'restricted',
+      readers: ['reader@example.dev', 'other@example.dev'],
+      readerDomains: ['acme.dev'],
+      maintainers: ['owner@example.dev'],
+      trustedPublishers: [{ provider: 'github', repository: 'acme/handbook', ref: 'refs/heads/main' }],
+      updatedBy: 'owner@example.dev',
+    });
+    expect(await grantsOf(name)).toEqual([
+      `${name}|domain|acme.dev`,
+      `${name}|maintainer|owner@example.dev`,
+      `${name}|reader|other@example.dev`,
+      `${name}|reader|reader@example.dev`,
+    ]);
+
+    // Fields that are not sent stay as they are; removed entries lose their grant.
+    const second = await patch(name, owner, { readers: ['other@example.dev'], visibility: 'public' });
+    expect(second.status).toBe(200);
+    expect(await accessOf(name)).toMatchObject({ visibility: 'public', readers: ['other@example.dev'], readerDomains: ['acme.dev'] });
+    expect((await adminDb.doc(`packages/${name}`).get()).data()?.visibility).toBe('public');
+    expect(await grantsOf(name)).toEqual([
+      `${name}|domain|acme.dev`,
+      `${name}|maintainer|owner@example.dev`,
+      `${name}|reader|other@example.dev`,
+    ]);
+  });
+
+  it('lets a maintainer hand over a package but never leave it without one', async () => {
+    const name = uniqueName('handover');
+    await publish(owner, await packageTgz(name, '1.0.0'));
+    expect((await patch(name, owner, { maintainers: [] })).status).toBe(400);
+    expect((await patch(name, owner, { maintainers: ['Reader@Example.dev'] })).status).toBe(200);
+    expect((await accessOf(name))?.maintainers).toEqual(['reader@example.dev']);
+    // The previous maintainer is one no longer; the new one is.
+    expect((await patch(name, owner, { visibility: 'public' })).status).toBe(403);
+    expect((await patch(name, reader, { visibility: 'public' })).status).toBe(200);
+    expect(await grantsOf(name)).toEqual([`${name}|maintainer|reader@example.dev`]);
+  });
+
+  it('refuses everyone but maintainers, with the same answer for an unknown package', async () => {
+    const name = uniqueName('access-denied');
+    await seedPackage(name, { readers: ['reader@example.dev'] });
+    const asReader = await patch(name, reader, { readers: ['reader@example.dev', 'x@example.dev'] });
+    const unknown = await patch(uniqueName('no-such'), reader, { readers: [] });
+    expect(asReader.status).toBe(403);
+    expect(unknown.status).toBe(403);
+    expect(asReader.body.error.code).toBe(unknown.body.error.code);
+    expect((await patch(name, undefined, { readers: [] })).status).toBe(401);
+    expect((await patch(name, await ciToken(), { readers: [] })).status).toBe(403);
+    expect((await accessOf(name))?.readers).toEqual(['reader@example.dev']);
+  });
+
+  it('rejects malformed changes without changing anything', async () => {
+    const name = uniqueName('access-invalid');
+    await seedPackage(name, { readers: ['reader@example.dev'] });
+    for (const change of [
+      {},
+      { readers: ['not-an-email'] },
+      { readers: 'reader@example.dev' },
+      { readerDomains: ['@example.dev'] },
+      { visibility: 'secret' },
+      { trustedPublishers: [{ provider: 'gitlab', repository: 'a/b' }] },
+      { description: 'x' },
+      { name: 'renamed' },
+    ]) {
+      expect((await patch(name, owner, change)).status, JSON.stringify(change)).toBe(400);
+    }
+    expect(await accessOf(name)).toMatchObject({ readers: ['reader@example.dev'], maintainers: ['owner@example.dev'] });
   });
 });
 
@@ -467,7 +567,12 @@ describe('downloading what was published', () => {
     expect((await download(artifact, reader)).status).toBe(403);
     expect((await download(artifact)).status).toBe(403);
 
-    await adminDb.doc(`packages/${name}`).update({ readers: ['reader@example.dev'] });
+    const granted = await call(`/packages/${name}/access`, {
+      method: 'PATCH',
+      token: owner,
+      body: JSON.stringify({ readers: ['reader@example.dev'] }),
+    });
+    expect(granted.status).toBe(200);
 
     const asReader = await download(artifact, reader);
     expect(asReader.status).toBe(200);

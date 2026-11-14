@@ -58,19 +58,47 @@ export interface SeedAccess {
   trustedPublishers?: unknown[];
 }
 
-/** Writes a package document directly, bypassing the API. */
+/** Writes a package with its access document and grants directly, bypassing the API. */
 export async function seedPackage(name: string, access: SeedAccess = {}): Promise<void> {
-  await adminDb.doc(`packages/${name}`).set({
+  const visibility = access.visibility ?? 'restricted';
+  const readers = access.readers ?? [];
+  const readerDomains = access.readerDomains ?? [];
+  const maintainers = access.maintainers ?? ['owner@example.dev'];
+  const batch = adminDb.batch();
+  batch.set(adminDb.doc(`packages/${name}`), {
     name,
     type: 'project',
     description: `${name} seeded`,
-    visibility: access.visibility ?? 'restricted',
-    readers: access.readers ?? [],
-    readerDomains: access.readerDomains ?? [],
-    maintainers: access.maintainers ?? ['owner@example.dev'],
-    trustedPublishers: access.trustedPublishers ?? [],
+    visibility,
     distTags: {},
     latestVersion: null,
     versionCount: 0,
   });
+  batch.set(adminDb.doc(`packages/${name}/private/access`), {
+    visibility,
+    readers,
+    readerDomains,
+    maintainers,
+    trustedPublishers: access.trustedPublishers ?? [],
+  });
+  const grants = [
+    ...readers.map((principal) => ({ kind: 'reader', principal })),
+    ...maintainers.map((principal) => ({ kind: 'maintainer', principal })),
+    ...readerDomains.map((principal) => ({ kind: 'domain', principal })),
+  ];
+  for (const grant of grants) {
+    batch.set(adminDb.doc(`grants/${name}|${grant.kind}|${grant.principal}`), { package: name, ...grant });
+  }
+  await batch.commit();
+}
+
+/** The access document of a package, read with administrator rights. */
+export async function accessOf(name: string): Promise<Record<string, any> | undefined> {
+  return (await adminDb.doc(`packages/${name}/private/access`).get()).data();
+}
+
+/** The ids of the grants of a package, sorted. */
+export async function grantsOf(name: string): Promise<string[]> {
+  const snapshot = await adminDb.collection('grants').where('package', '==', name).get();
+  return snapshot.docs.map((entry) => entry.id).sort();
 }
