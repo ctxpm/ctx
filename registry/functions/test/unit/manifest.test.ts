@@ -68,6 +68,8 @@ describe('parseManifest', () => {
     [{ ...valid, dependencies: { 'Bad Name': '1.0.0' } }, 'dependency name'],
     [{ ...valid, dependencies: { other: 'not a range' } }, 'invalid version range'],
     [{ ...valid, dependencies: { 'team-handbook': '*' } }, 'cannot depend on itself'],
+    [{ ...valid, dependencies: { other: '^1.0.0 || ^2.0.0' } }, 'not supported'],
+    [{ ...valid, dependencies: { other: '1.0.0 - 2.0.0' } }, 'not supported'],
     [{ ...valid, provides: 'x' }, 'provides'],
   ])('rejects %j', (data, expected) => {
     const found = problems(data);

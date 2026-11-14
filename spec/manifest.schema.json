@@ -20,7 +20,7 @@
     },
     "description": { "type": "string", "maxLength": 500 },
     "dependencies": {
-      "description": "Package name to semver range.",
+      "description": "Package name to semver range: *, an exact version, ^ and ~ ranges, wildcards (1.x) and comparators joined by spaces or commas. Alternatives (||) and hyphen ranges are not supported.",
       "type": "object",
       "maxProperties": 200,
       "propertyNames": { "$ref": "#/$defs/packageName" },

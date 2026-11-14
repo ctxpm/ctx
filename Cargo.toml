@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/ctx-core", "crates/ctx-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ctxpm/ctx"
+rust-version = "1.85"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

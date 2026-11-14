@@ -31,6 +31,16 @@
       "description": "Base URL of the publish API, without a trailing slash and including the version segment, for example https://registry.example.dev/v1.",
       "type": "string"
     },
+    "endpoints": {
+      "description": "Overrides of the Google service base URLs. Only for emulators and tests; a production registry leaves this out.",
+      "type": "object",
+      "properties": {
+        "identityToolkit": { "type": "string" },
+        "secureToken": { "type": "string" },
+        "firestore": { "type": "string" },
+        "storage": { "type": "string" }
+      }
+    },
     "oidcAudience": {
       "description": "Audience a CI job must request for its OIDC token when publishing.",
       "type": "string"

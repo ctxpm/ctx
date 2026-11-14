@@ -86,6 +86,9 @@ export function parseManifest(raw: string): Manifest {
           problems.push('a package cannot depend on itself');
         } else if (typeof range !== 'string' || range.length > 128 || semver.validRange(range) === null) {
           problems.push(`dependency "${name}" has an invalid version range`);
+        } else if (range.includes('||') || / - /.test(range)) {
+          // The CLI resolves a common subset of range syntax; refuse what it cannot read.
+          problems.push(`dependency "${name}" uses "||" or a hyphen range, which is not supported`);
         } else {
           dependencies[name] = range;
         }

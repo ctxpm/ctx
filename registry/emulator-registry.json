@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "name": "local",
+  "firebase": {
+    "projectId": "demo-ctx",
+    "apiKey": "fake-api-key",
+    "storageBucket": "demo-ctx.firebasestorage.app"
+  },
+  "api": "http://127.0.0.1:5001/demo-ctx/europe-west4/api/v1",
+  "oidcAudience": "ctx:demo-ctx",
+  "endpoints": {
+    "identityToolkit": "http://127.0.0.1:9099/identitytoolkit.googleapis.com",
+    "secureToken": "http://127.0.0.1:9099/securetoken.googleapis.com",
+    "firestore": "http://127.0.0.1:8085",
+    "storage": "http://127.0.0.1:9199"
+  }
+}
