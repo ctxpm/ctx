@@ -1,0 +1,96 @@
+name: Release CLI
+
+# Push a tag such as cli-v0.1.0 to build the ctx binary for every platform and publish a
+# GitHub release. The tag must match the version in Cargo.toml.
+on:
+  push:
+    tags: ['cli-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: macos-latest
+            asset: ctx-universal-apple-darwin
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+          - os: ubuntu-latest
+            asset: ctx-x86_64-unknown-linux-gnu
+            targets: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            asset: ctx-x86_64-pc-windows-msvc
+            targets: x86_64-pc-windows-msvc
+    env:
+      # Registry a fresh install talks to until the user adds another one.
+      CTX_DEFAULT_REGISTRY: ${{ vars.CTX_DEFAULT_REGISTRY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - name: Check that the tag matches the crate version
+        shell: bash
+        run: |
+          crate="$(grep -m1 '^version' Cargo.toml | cut -d '"' -f 2)"
+          tag="${GITHUB_REF_NAME#cli-v}"
+          [ "$crate" = "$tag" ] || { echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $crate"; exit 1; }
+      - name: Build
+        shell: bash
+        run: |
+          for target in ${{ matrix.targets }}; do
+            cargo build --release --locked -p ctx-cli --target "$target"
+          done
+      - name: Package (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir out
+          lipo -create -output out/ctx \
+            target/aarch64-apple-darwin/release/ctx \
+            target/x86_64-apple-darwin/release/ctx
+          # Apple silicon refuses unsigned code; an ad-hoc signature is enough to run.
+          codesign --force --sign - out/ctx
+          tar -czf "${{ matrix.asset }}.tar.gz" -C out ctx
+          shasum -a 256 "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256"
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          tar -czf "${{ matrix.asset }}.tar.gz" -C "target/${{ matrix.targets }}/release" ctx
+          sha256sum "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.targets }}/release/ctx.exe" -DestinationPath "${{ matrix.asset }}.zip"
+          $hash = (Get-FileHash "${{ matrix.asset }}.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  ${{ matrix.asset }}.zip" | Out-File -Encoding ascii "${{ matrix.asset }}.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ctx ${GITHUB_REF_NAME#cli-v}" \
+            --generate-notes
