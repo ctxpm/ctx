@@ -21,7 +21,6 @@ import {
   getDocs,
   getFirestore,
   query,
-  updateDoc,
   where,
   type Firestore,
   type Timestamp,
@@ -49,11 +48,16 @@ export interface Package {
   visibility: 'public' | 'restricted';
   latest: string | null;
   distTags: Record<string, string>;
+  versionCount: number;
+}
+
+/** Who may read, maintain and publish a package. Only its maintainers receive this. */
+export interface Access {
+  visibility: 'public' | 'restricted';
   readers: string[];
   readerDomains: string[];
   maintainers: string[];
   trustedPublishers: TrustedPublisher[];
-  versionCount: number;
 }
 
 export interface Version {
@@ -158,36 +162,47 @@ function toPackage(data: Record<string, unknown>): Package {
     visibility: data.visibility === 'public' ? 'public' : 'restricted',
     latest: distTags.latest ?? null,
     distTags,
-    readers: strings(data.readers),
-    readerDomains: strings(data.readerDomains),
-    maintainers: strings(data.maintainers),
-    trustedPublishers: Array.isArray(data.trustedPublishers) ? (data.trustedPublishers as TrustedPublisher[]) : [],
     versionCount: Number(data.versionCount ?? 0),
   };
 }
 
+function toAccess(data: Record<string, unknown>): Access {
+  return {
+    visibility: data.visibility === 'public' ? 'public' : 'restricted',
+    readers: strings(data.readers),
+    readerDomains: strings(data.readerDomains),
+    maintainers: strings(data.maintainers),
+    trustedPublishers: Array.isArray(data.trustedPublishers) ? (data.trustedPublishers as TrustedPublisher[]) : [],
+  };
+}
+
 /**
- * Every package the visitor may read. The registry only answers queries limited to what
- * the visitor is entitled to, so this asks once per kind of entitlement and merges.
+ * Every package the visitor may read: the public ones, plus what is shared with them. The
+ * registry shows a visitor only the grants that name their address or their domain.
  */
 export async function listPackages(): Promise<Package[]> {
   if (!db) {
     return [];
   }
-  const packages = collection(db, 'packages');
-  const queries = [query(packages, where('visibility', '==', 'public'))];
+  const found = new Map<string, Package>();
+  const publicOnes = await getDocs(query(collection(db, 'packages'), where('visibility', '==', 'public')));
+  for (const entry of publicOnes.docs) {
+    found.set(entry.id, toPackage(entry.data()));
+  }
+
   const email = session.email;
   if (email) {
-    queries.push(
-      query(packages, where('readers', 'array-contains', email)),
-      query(packages, where('maintainers', 'array-contains', email)),
-      query(packages, where('readerDomains', 'array-contains', email.split('@')[1] ?? '')),
-    );
-  }
-  const found = new Map<string, Package>();
-  for (const snapshot of await Promise.all(queries.map((entry) => getDocs(entry)))) {
-    for (const entry of snapshot.docs) {
-      found.set(entry.id, toPackage(entry.data()));
+    const grants = collection(db, 'grants');
+    const snapshots = await Promise.all([
+      getDocs(query(grants, where('kind', 'in', ['reader', 'maintainer']), where('principal', '==', email))),
+      getDocs(query(grants, where('kind', '==', 'domain'), where('principal', '==', email.split('@')[1] ?? ''))),
+    ]);
+    const names = new Set(snapshots.flatMap((snapshot) => snapshot.docs.map((entry) => String(entry.data().package))));
+    const shared = await Promise.all([...names].filter((name) => !found.has(name)).map((name) => getPackage(name)));
+    for (const entry of shared) {
+      if (entry) {
+        found.set(entry.name, entry);
+      }
     }
   }
   return [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -201,6 +216,19 @@ export async function getPackage(name: string): Promise<Package | null> {
   try {
     const snapshot = await getDoc(doc(db, 'packages', name));
     return snapshot.exists() ? toPackage(snapshot.data()) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Who has access to a package, or null when the visitor is not one of its maintainers. */
+export async function getAccess(name: string): Promise<Access | null> {
+  if (!db || !session.email) {
+    return null;
+  }
+  try {
+    const snapshot = await getDoc(doc(db, 'packages', name, 'private', 'access'));
+    return snapshot.exists() ? toAccess(snapshot.data()) : null;
   } catch {
     return null;
   }
@@ -259,36 +287,35 @@ export async function getVersions(name: string): Promise<Version[]> {
     .sort((a, b) => newestFirst(a.version, b.version));
 }
 
-export type AccessChange = Partial<
-  Pick<Package, 'visibility' | 'readers' | 'readerDomains' | 'maintainers' | 'trustedPublishers'>
->;
+export type AccessChange = Partial<Access>;
 
-/** Changes the access lists of a package. The registry only allows this to maintainers. */
-export async function updateAccess(name: string, change: AccessChange): Promise<void> {
-  if (!db) {
-    throw new Error('Not connected to the registry');
+/** Calls the registry's write API as the signed-in visitor. */
+async function callApi(method: string, path: string, body: unknown): Promise<void> {
+  const token = await auth?.currentUser?.getIdToken();
+  if (!token) {
+    throw new Error('Sign in first');
   }
-  await updateDoc(doc(db, 'packages', name), change);
+  const response = await fetch(`${api}${path}`, {
+    method,
+    headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const answer = (await response.json().catch(() => null)) as { error?: { message?: string } } | null;
+    throw new Error(answer?.error?.message ?? `The registry returned ${response.status}`);
+  }
+}
+
+/** Changes who has access to a package. The registry only allows this to maintainers. */
+export function updateAccess(name: string, change: AccessChange): Promise<void> {
+  return callApi('PATCH', `/packages/${encodeURIComponent(name)}/access`, change);
 }
 
 /** Yanks a version, or restores it. */
-export async function setYanked(name: string, version: string, yanked: boolean): Promise<void> {
-  const token = await auth?.currentUser?.getIdToken();
-  if (!token) {
-    throw new Error('Sign in to change a version');
-  }
-  const response = await fetch(
-    `${api}/packages/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}/yank`,
-    {
-      method: 'POST',
-      headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
-      body: JSON.stringify({ yanked }),
-    },
-  );
-  if (!response.ok) {
-    const body = (await response.json().catch(() => null)) as { error?: { message?: string } } | null;
-    throw new Error(body?.error?.message ?? `The registry returned ${response.status}`);
-  }
+export function setYanked(name: string, version: string, yanked: boolean): Promise<void> {
+  return callApi('POST', `/packages/${encodeURIComponent(name)}/versions/${encodeURIComponent(version)}/yank`, {
+    yanked,
+  });
 }
 
 /** Common package types keep a colour of their own; any other type gets one by hash. */

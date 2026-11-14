@@ -14,6 +14,8 @@ publish API, CLI, web UI).
 - The Firebase web configuration and the OAuth client id of a registry are public by
   design. They grant nothing by themselves.
 - Read access is enforced by the Firestore and Storage security rules in `registry/`.
+  Clients cannot write anything; who has access to a package is visible to its
+  maintainers only.
 - Write access to versions and artifacts is only possible through the publish API in
   `registry/functions`, which verifies the caller and makes published versions immutable.
 - The CLI verifies the SHA-256 digest of every artifact against the registry index before

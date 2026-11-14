@@ -4,7 +4,7 @@ The registry is a Firebase project with four parts:
 
 | Part | Role |
 |---|---|
-| Firestore | Index: one document per package, one per version |
+| Firestore | Index: one document per package and per version, plus who has access |
 | Cloud Storage | Artifacts: `packages/<name>/<version>/<sha256>.tgz` |
 | Authentication | Google sign-in; identity is the verified email address |
 | Cloud Function `api` | The only way to write: create packages, publish, yank |
@@ -15,18 +15,22 @@ decide what each caller may see.
 
 ## Access model
 
-A package document carries its own access lists:
+Access to a package is kept apart from the package itself:
 
-| Field | Meaning |
-|---|---|
-| `visibility` | `public` (anyone, signed in or not) or `restricted` |
-| `readers` | Email addresses that may read a restricted package |
-| `readerDomains` | Email domains that may read a restricted package |
-| `maintainers` | Email addresses that may publish, yank and edit the access lists |
-| `trustedPublishers` | CI workflows that may publish without a personal credential |
+| Document | Holds | Who can read it |
+|---|---|---|
+| `packages/{name}` | type, description, visibility, dist-tags, counts | anyone entitled to the package |
+| `packages/{name}/private/access` | `visibility`, `readers`, `readerDomains`, `maintainers`, `trustedPublishers` | maintainers of that package |
+| `grants/{package}\|{kind}\|{who}` | one entry per reader, domain or maintainer | only the person or domain it names |
 
-Email addresses and domains are stored in lower case. A package you cannot read does not
-show up in any query you are allowed to run.
+- `visibility` is `public` (anyone, signed in or not) or `restricted`.
+- `readers` and `readerDomains` are the email addresses and email domains that may read a
+  restricted package. `maintainers` may publish, yank and change access.
+- A reader does not see who else has access, or who maintains a package.
+- A package you cannot read does not show up in any query you are allowed to run. A client
+  finds what is shared with it through its own grants, then reads those packages.
+- Nothing is writable by clients. Every change goes through the write API, which validates
+  and normalises it and keeps the grants in line with the access document.
 
 Who may claim a **new** package name is set in the document `registry/config`, which only
 the function can read:
@@ -48,6 +52,7 @@ signed-in user, or an OIDC token from GitHub Actions requested for the registry'
 | `POST /packages` | creators | Claims a name and sets its access lists (JSON body) |
 | `POST /publish[?tag=<name>]` | maintainers, trusted publishers | Body is the `.tgz`; name and version come from its `manifest.json`. A creator publishing an unknown name creates the package as `restricted` |
 | `POST /packages/<name>/versions/<version>/yank` | maintainers | Body `{"yanked": true}` or `false` |
+| `PATCH /packages/<name>/access` | maintainers | Replaces any of `visibility`, `readers`, `readerDomains`, `maintainers`, `trustedPublishers`; what is left out stays as it is |
 
 Publishing a version that already exists returns `409`; versions are immutable. Without
 `?tag`, `latest` follows the highest stable version that is not yanked.
@@ -122,3 +127,15 @@ the API tests against them. Nothing touches a real Firebase project.
    ```
 
 People then run `ctx registry add https://<your site>`.
+
+### Upgrading a registry from before 0.2.0
+
+Access lists used to live on the package document. After deploying 0.2.0, move them once:
+
+```sh
+cd registry/functions
+GCLOUD_PROJECT=<project id> node scripts/migrate-access.mjs           # shows what would change
+GCLOUD_PROJECT=<project id> node scripts/migrate-access.mjs --apply
+```
+
+Clients older than 0.2.0 only see public packages afterwards.
